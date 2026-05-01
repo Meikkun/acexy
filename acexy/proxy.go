@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"javinator9889/acexy/lib/acexy"
 	"log/slog"
 	"net/http"
@@ -91,56 +92,67 @@ func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set response headers BEFORE starting the stream. Once StartStream is called,
-	// the copier can immediately begin writing to the ResponseWriter from another
-	// goroutine. Header map writes are safe before the first Write/WriteHeader call.
-	// We intentionally do NOT call WriteHeader here — Go's HTTP server calls it
-	// implicitly on the first Write, and keeping it implicit means we can still
-	// return an HTTP error if StartStream fails.
+	// Set response headers BEFORE starting the stream. Header map writes are safe
+	// before the first Write/WriteHeader call. We intentionally do NOT call
+	// WriteHeader here — Go's HTTP server calls it implicitly on the first Write.
 	switch p.Acexy.Endpoint {
 	case acexy.M3U8_ENDPOINT:
 		w.Header().Set("Content-Type", "application/x-mpegURL")
 	case acexy.MPEG_TS_ENDPOINT:
 		w.Header().Set("Content-Type", "video/MP2T")
-		w.Header().Set("Transfer-Encoding", "chunked")
 	}
 
-	// Start playing the stream. The `StartStream` will dump the contents of the new or
-	// existing stream to the client. It takes an interface of `io.Writer` to write the stream
-	// contents to. The `http.ResponseWriter` implements the `io.Writer` interface, so we can
-	// pass it directly.
+	// Create a pipe so that PMultiWriter writes to the pipe writer (safe cross-goroutine)
+	// and the HTTP handler goroutine copies from the pipe reader to ResponseWriter.
+	pr, pw := io.Pipe()
+
 	slog.Debug("Starting stream", "path", r.URL.Path, "id", aceId)
-	if err := p.Acexy.StartStream(stream, w); err != nil {
+	if err := p.Acexy.StartStream(stream, pw); err != nil {
+		pw.Close()
 		slog.Error("Failed to start stream", "stream", aceId, "error", err)
 		http.Error(w, "Failed to start stream: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Defer the stream finish. This will be called when the request is done. When in M3U8 mode,
-	// the client connects directly to a subset of endpoints, so we are blind to what the client
-	// is doing. However, it periodically polls the M3U8 list to verify nothing has changed,
-	// simulating a new connection. Therefore, we can accumulate a lot of open streams and let
-	// the timeout finish them.
-	//
-	// When in MPEG-TS mode, the client connects to the endpoint and waits for the stream to finish.
-	// This is a blocking operation, so we can finish the stream when the client disconnects.
+	// Goroutine: copy pipe reader -> ResponseWriter (only this goroutine touches w)
+	doneCopy := make(chan struct{})
+	go func() {
+		defer close(doneCopy)
+		_, err := io.Copy(w, pr)
+		if err != nil {
+			slog.Debug("Client copy error", "stream", aceId, "error", err)
+		}
+		pr.Close() // ensure cleanup
+	}()
+
+	// Defer cleanup: stop stream, close pipe writer, and wait for copy goroutine
+	// to finish before returning. This prevents races between net/http request
+	// teardown and our background writes to ResponseWriter.
 	switch p.Acexy.Endpoint {
 	case acexy.M3U8_ENDPOINT:
 		timedOut := acexy.SetTimeout(streamTimeout)
 		defer func() {
 			<-timedOut
-			p.Acexy.StopStream(stream, w)
+			p.Acexy.StopStream(stream, pw)
+			pw.Close()
+			<-doneCopy
 		}()
 	case acexy.MPEG_TS_ENDPOINT:
-		defer p.Acexy.StopStream(stream, w)
+		defer func() {
+			p.Acexy.StopStream(stream, pw)
+			pw.Close()
+			<-doneCopy
+		}()
 	}
 
-	// And wait for the client to disconnect
+	// Wait for client disconnect, stream finish, or copy goroutine done
 	select {
 	case <-r.Context().Done():
 		slog.Debug("Client disconnected", "path", r.URL.Path)
 	case <-p.Acexy.WaitStream(stream):
 		slog.Debug("Stream finished", "path", r.URL.Path)
+	case <-doneCopy:
+		slog.Debug("Client copy done", "path", r.URL.Path)
 	}
 }
 
