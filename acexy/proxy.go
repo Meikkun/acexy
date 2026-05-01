@@ -151,35 +151,58 @@ func (p *Proxy) HandleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var aceId *acexy.AceID
 	q := r.URL.Query()
 	slog.Debug("Status request", "path", r.URL.Path, "query", q)
-	id, err := acexy.NewAceID(q.Get("id"), q.Get("infohash"))
-	if err == nil {
-		aceId = &id
-	} else {
-		// If no parameter is included, ask for the global status
-		aceId = nil
+
+	hasID := q.Has("id")
+	hasInfohash := q.Has("infohash")
+	idVal := q.Get("id")
+	infohashVal := q.Get("infohash")
+
+	// No parameters => global status
+	if !hasID && !hasInfohash {
+		status, err := p.Acexy.GetStatus(nil)
+		if err != nil {
+			slog.Error("Failed to get status", "error", err)
+			http.Error(w, "Stream not found", http.StatusNotFound)
+			return
+		}
+		writeStatusJSON(w, status)
+		return
 	}
 
-	// Get the status of the stream
-	slog.Debug("Getting status", "id", aceId)
-	status, err := p.Acexy.GetStatus(aceId)
+	// Both provided, or one provided but empty => bad request
+	if (hasID && hasInfohash) || (hasID && idVal == "") || (hasInfohash && infohashVal == "") {
+		slog.Error("Invalid status query parameters", "id", idVal, "infohash", infohashVal)
+		http.Error(w, "Invalid query parameters: provide exactly one of id or infohash", http.StatusBadRequest)
+		return
+	}
+
+	aceId, err := acexy.NewAceID(idVal, infohashVal)
+	if err != nil {
+		slog.Error("Invalid status query parameters", "error", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	status, err := p.Acexy.GetStatus(&aceId)
 	if err != nil {
 		slog.Error("Failed to get status", "error", err)
 		http.Error(w, "Stream not found", http.StatusNotFound)
 		return
 	}
 
+	writeStatusJSON(w, status)
+}
+
+func writeStatusJSON(w http.ResponseWriter, status acexy.AcexyStatus) {
 	slog.Debug("Status", "status", status)
-	// Write the status to the client as JSON
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 
 	if err := json.NewEncoder(w).Encode(status); err != nil {
 		slog.Error("Failed to write status", "error", err)
 		http.Error(w, "Failed to write status", http.StatusInternalServerError)
-		return
 	}
 }
 
