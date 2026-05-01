@@ -40,6 +40,27 @@ func startMockBackend() *httptest.Server {
 		w.Write([]byte(jsonResp))
 	})
 
+	// /ace/manifest.m3u8 endpoint (M3U8 mode)
+	mux.HandleFunc("/ace/manifest.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		// Return the same JSON response as getstream for test purposes
+		host := r.Host
+		jsonResp := fmt.Sprintf(`{
+			"response": {
+				"playback_url": "http://%s/stream",
+				"stat_url": "http://%s/stat",
+				"command_url": "http://%s/command",
+				"infohash": "hash",
+				"playback_session_id": "session",
+				"is_live": 1,
+				"is_encrypted": 0,
+				"client_session_id": 123
+			},
+			"error": null
+		}`, host, host, host)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(jsonResp))
+	})
+
 	// /stream endpoint (Infinite stream)
 	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
 		// Write data continuously
@@ -893,6 +914,136 @@ func TestStreamFailureReturnsError(t *testing.T) {
 	}
 
 	t.Log("PASS: Stream responses are correct (data on success, error on failure)")
+}
+
+func TestM3U8_TimeoutCleanup(t *testing.T) {
+	// Setup Logging
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, opts)))
+
+	backend := startMockBackend()
+	defer backend.Close()
+
+	backendURL, _ := url.Parse(backend.URL)
+	backendPort := backendURL.Port()
+	backendHost := backendURL.Hostname()
+
+	a := &acexy.Acexy{
+		Scheme:            "http",
+		Host:              backendHost,
+		Port:              mustParseInt(backendPort),
+		Endpoint:          acexy.M3U8_ENDPOINT,
+		EmptyTimeout:      5 * time.Second,
+		BufferSize:        1024,
+		NoResponseTimeout: 2 * time.Second,
+	}
+	a.Init()
+
+	proxy := &Proxy{Acexy: a}
+	proxyServer := httptest.NewServer(proxy)
+	defer proxyServer.Close()
+
+	// Use a very short timeout so the test completes quickly
+	shortTimeout := 200 * time.Millisecond
+	// We'll temporarily replace the streamTimeout global, but since it's a package var,
+	// we need to be careful. Instead, let's test indirectly.
+	// Actually, streamTimeout is a package-level var in proxy.go. Let's set it.
+	// We'll restore it after.
+	oldTimeout := streamTimeout
+	streamTimeout = shortTimeout
+	defer func() { streamTimeout = oldTimeout }()
+
+	resp, err := http.Get(proxyServer.URL + "/ace/getstream?id=m3u8-timeout")
+	if err != nil {
+		t.Fatalf("M3U8 request failed: %v", err)
+	}
+	// Read some data to ensure the stream started
+	buf := make([]byte, 1024)
+	resp.Body.Read(buf)
+	resp.Body.Close()
+
+	// Verify stream exists before timeout
+	status, err := a.GetStatus(nil)
+	if err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	if status.Streams == nil || *status.Streams == 0 {
+		t.Fatal("Expected at least one active stream before timeout")
+	}
+
+	// Wait for timeout + cleanup
+	time.Sleep(shortTimeout + 300*time.Millisecond)
+
+	// Verify stream is cleaned up after timeout
+	status, err = a.GetStatus(nil)
+	if err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	if status.Streams != nil && *status.Streams != 0 {
+		t.Fatalf("Expected 0 streams after timeout, got %d", *status.Streams)
+	}
+}
+
+func TestM3U8_EarlyDisconnect(t *testing.T) {
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, opts)))
+
+	backend := startMockBackend()
+	defer backend.Close()
+
+	backendURL, _ := url.Parse(backend.URL)
+	backendPort := backendURL.Port()
+	backendHost := backendURL.Hostname()
+
+	a := &acexy.Acexy{
+		Scheme:            "http",
+		Host:              backendHost,
+		Port:              mustParseInt(backendPort),
+		Endpoint:          acexy.M3U8_ENDPOINT,
+		EmptyTimeout:      5 * time.Second,
+		BufferSize:        1024,
+		NoResponseTimeout: 2 * time.Second,
+	}
+	a.Init()
+
+	proxy := &Proxy{Acexy: a}
+	proxyServer := httptest.NewServer(proxy)
+	defer proxyServer.Close()
+
+	// Use a long timeout so we can verify early disconnect works
+	oldTimeout := streamTimeout
+	streamTimeout = 5 * time.Second
+	defer func() { streamTimeout = oldTimeout }()
+
+	resp, err := http.Get(proxyServer.URL + "/ace/getstream?id=m3u8-early")
+	if err != nil {
+		t.Fatalf("M3U8 request failed: %v", err)
+	}
+	// Read some data
+	buf := make([]byte, 1024)
+	resp.Body.Read(buf)
+	resp.Body.Close()
+
+	// Verify stream exists
+	status, err := a.GetStatus(nil)
+	if err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	if status.Streams == nil || *status.Streams == 0 {
+		t.Fatal("Expected at least one active stream before disconnect")
+	}
+
+	// Wait a short time for cleanup after disconnect
+	time.Sleep(300 * time.Millisecond)
+
+	// Verify stream is cleaned up after early disconnect
+	status, err = a.GetStatus(nil)
+	if err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	if status.Streams != nil && *status.Streams != 0 {
+		t.Fatalf("Expected 0 streams after early disconnect, got %d", *status.Streams)
+	}
 }
 
 func mustParseInt(s string) int {

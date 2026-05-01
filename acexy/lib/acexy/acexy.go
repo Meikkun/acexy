@@ -545,16 +545,3 @@ func (a *Acexy) GetStatus(id *AceID) (AcexyStatus, error) {
 
 	return AcexyStatus{}, fmt.Errorf(`stream "%s" not found`, id)
 }
-
-// Creates a timeout channel that will be closed after the given timeout
-func SetTimeout(timeout time.Duration) chan struct{} {
-	// Create a channel that will be closed after the given timeout
-	timeoutChan := make(chan struct{})
-
-	go func() {
-		time.Sleep(timeout)
-		close(timeoutChan)
-	}()
-
-	return timeoutChan
-}

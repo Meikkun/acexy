@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -132,11 +133,24 @@ func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 	// teardown and our background writes to ResponseWriter.
 	switch p.Acexy.Endpoint {
 	case acexy.M3U8_ENDPOINT:
-		timedOut := acexy.SetTimeout(streamTimeout)
+		var cleanupOnce sync.Once
+		cleanup := func() {
+			cleanupOnce.Do(func() {
+				p.Acexy.StopStream(stream, pw)
+				pw.Close()
+			})
+		}
+		timer := time.AfterFunc(streamTimeout, cleanup)
 		defer func() {
-			<-timedOut
-			p.Acexy.StopStream(stream, pw)
-			pw.Close()
+			if !timer.Stop() {
+				// Timer already fired; wait for copy goroutine to finish.
+				if streamStarted {
+					<-doneCopy
+				}
+				return
+			}
+			// Timer stopped before firing; run cleanup now.
+			cleanup()
 			if streamStarted {
 				<-doneCopy
 			}
