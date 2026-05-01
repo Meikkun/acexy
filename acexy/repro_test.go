@@ -17,7 +17,7 @@ import (
 // Mock AceStream Backend
 func startMockBackend() *httptest.Server {
 	mux := http.NewServeMux()
-	
+
 	// /ace/getstream endpoint
 	mux.HandleFunc("/ace/getstream", func(w http.ResponseWriter, r *http.Request) {
 		// Return JSON response with playback URL
@@ -47,7 +47,7 @@ func startMockBackend() *httptest.Server {
 		for i := 0; i < len(chunk); i++ {
 			chunk[i] = 'A'
 		}
-		
+
 		for {
 			_, err := w.Write(chunk)
 			if err != nil {
@@ -86,7 +86,7 @@ func TestDeadlockReproduction(t *testing.T) {
 
 	// Configure Acexy
 	// Small buffer size to fill it quickly
-	bufferSize := 1024 
+	bufferSize := 1024
 
 	a := &acexy.Acexy{
 		Scheme:            "http",
@@ -100,7 +100,7 @@ func TestDeadlockReproduction(t *testing.T) {
 	a.Init()
 
 	proxy := &Proxy{Acexy: a}
-	
+
 	proxyServer := httptest.NewServer(proxy)
 	defer proxyServer.Close()
 
@@ -136,7 +136,7 @@ func TestDeadlockReproduction(t *testing.T) {
 	// We use a context to cancel B
 	ctxB, cancelB := context.WithCancel(context.Background())
 	reqB, _ := http.NewRequestWithContext(ctxB, "GET", proxyServer.URL+"/ace/getstream?id="+streamID, nil)
-	
+
 	// Start B in goroutine so we can cancel it
 	var wgB sync.WaitGroup
 	wgB.Add(1)
@@ -162,7 +162,7 @@ func TestDeadlockReproduction(t *testing.T) {
 	// 4. Client C connects (should succeed if no deadlock)
 	fmt.Println("Step 4: Client C connecting...")
 	clientC := &http.Client{Timeout: 2 * time.Second}
-	
+
 	doneC := make(chan error)
 	go func() {
 		respC, err := makeRequest(clientC, "otherstream") // different ID to trigger FetchStream -> Lock
