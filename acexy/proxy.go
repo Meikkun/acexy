@@ -194,8 +194,8 @@ func LookupEnvOrInt(key string, def int) int {
 	if val, ok := os.LookupEnv(key); ok {
 		i, err := strconv.Atoi(val)
 		if err != nil {
-			slog.Error("Failed to parse environment variable", "key", key, "value", val)
-			return 0
+			slog.Warn("Failed to parse environment variable, using default", "key", key, "value", val, "default", def)
+			return def
 		}
 		return i
 	}
@@ -206,8 +206,8 @@ func LookupEnvOrDuration(key string, def time.Duration) time.Duration {
 	if val, ok := os.LookupEnv(key); ok {
 		d, err := time.ParseDuration(val)
 		if err != nil {
-			slog.Error("Failed to parse environment variable", "key", key, "value", val)
-			return 0
+			slog.Warn("Failed to parse environment variable, using default", "key", key, "value", val, "default", def)
+			return def
 		}
 		return d
 	}
@@ -218,8 +218,8 @@ func LookupEnvOrBool(key string, def bool) bool {
 	if val, ok := os.LookupEnv(key); ok {
 		b, err := strconv.ParseBool(val)
 		if err != nil {
-			slog.Error("Failed to parse environment variable", "key", key, "value", val)
-			return false
+			slog.Warn("Failed to parse environment variable, using default", "key", key, "value", val, "default", def)
+			return def
 		}
 		return b
 	}
@@ -240,15 +240,14 @@ func LookupLogLevel() slog.Level {
 }
 
 func LookupEnvOrSize(key string, def uint64) *Size {
+	s := &Size{Bytes: def}
 	if val, ok := os.LookupEnv(key); ok {
-		if err := size.Set(val); err != nil {
-			slog.Error("Failed to parse environment variable", "key", key, "value", val)
-			return nil
+		if err := s.Set(val); err != nil {
+			slog.Warn("Failed to parse environment variable, using default", "key", key, "value", val, "default", def)
+			s.Bytes = def
 		}
-	} else {
-		size.Bytes = def
 	}
-	return &size
+	return s
 }
 
 func (s *Size) Set(value string) error {
