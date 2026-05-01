@@ -168,7 +168,7 @@ func (pmw *PMultiWriter) Write(p []byte) (n int, err error) {
 	for range writers {
 		select {
 		case <-pmw.closed:
-			slog.Debug("closed pmw", "pmw", pmw)
+			slog.Debug("closed pmw")
 			return 0, io.ErrClosedPipe
 		case res := <-results:
 			if res.err != nil {

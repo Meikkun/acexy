@@ -151,6 +151,13 @@ func (a *Acexy) FetchStream(aceId AceID, extraParams url.Values) (*AceStream, er
 	// Another goroutine may have created this stream while the mutex was released
 	if existing, ok := a.streams[aceId]; ok {
 		slog.Info("Reusing existing (created during fetch)", "stream", aceId, "clients", existing.clients)
+		// Close the duplicate backend stream to prevent leak
+		go func(commandURL string) {
+			dup := &AceStream{CommandURL: commandURL}
+			if err := CloseStream(dup); err != nil {
+				slog.Debug("Error closing duplicate backend stream", "error", err)
+			}
+		}(middleware.Response.CommandURL)
 		return existing.stream, nil
 	}
 
@@ -178,13 +185,15 @@ func (a *Acexy) FetchStream(aceId AceID, extraParams url.Values) (*AceStream, er
 	// client count. StopStream checks this set to avoid double-decrementing.
 	writers.SetOnEvict(func(w io.Writer) {
 		a.mutex.Lock()
-		defer a.mutex.Unlock()
 		os.evicted[w] = struct{}{}
 		if os.clients > 0 {
 			os.clients--
 			slog.Info("Writer evicted by timeout", "stream", aceId, "clients", os.clients)
 		}
-		if os.clients == 0 {
+		shouldRelease := os.clients == 0
+		a.mutex.Unlock()
+
+		if shouldRelease {
 			if err := a.releaseStream(stream); err != nil {
 				slog.Warn("Error releasing stream after eviction", "error", err)
 			}
@@ -229,13 +238,13 @@ func (a *Acexy) StartStream(stream *AceStream, out io.Writer) error {
 
 	// Re-acquire the mutex to update state
 	a.mutex.Lock()
-	defer a.mutex.Unlock()
 
 	// Re-check the stream still exists (could have been released while
 	// the mutex was not held). If the stream was released, our writer and
 	// client count were already cleaned up by releaseStream/StopStream.
 	ongoingStream, ok = a.streams[stream.ID]
 	if !ok {
+		a.mutex.Unlock()
 		if resp != nil {
 			resp.Body.Close()
 		}
@@ -251,7 +260,9 @@ func (a *Acexy) StartStream(stream *AceStream, out io.Writer) error {
 		// dereference panic.
 		ongoingStream.writers.Remove(out)
 		ongoingStream.clients--
-		if ongoingStream.clients == 0 {
+		shouldRelease := ongoingStream.clients == 0
+		a.mutex.Unlock()
+		if shouldRelease {
 			if releaseErr := a.releaseStream(stream); releaseErr != nil {
 				slog.Warn("Error releasing stream", "error", releaseErr)
 			}
@@ -261,6 +272,7 @@ func (a *Acexy) StartStream(stream *AceStream, out io.Writer) error {
 
 	// Another goroutine may have started playback while the mutex was released
 	if ongoingStream.player != nil {
+		a.mutex.Unlock()
 		resp.Body.Close()
 		return nil
 	}
@@ -290,54 +302,63 @@ func (a *Acexy) StartStream(stream *AceStream, out io.Writer) error {
 	}()
 
 	ongoingStream.player = resp
+	a.mutex.Unlock()
 	return nil
 }
 
 // Releases a stream that is no longer being used. The stream is removed from the AceStream backend.
 // If the stream is not enqueued, an error is returned. If the stream has clients reproducing it,
-// the stream is not removed. The stream is identified by the “id“ identifier.
+// the stream is not removed. The stream is identified by the "id" identifier.
 //
-// Note: The global mutex is locked and unlocked by the caller.
+	// This function acquires the mutex internally. Callers must NOT hold the mutex.
 func (a *Acexy) releaseStream(stream *AceStream) error {
+	a.mutex.Lock()
 	ongoingStream, ok := a.streams[stream.ID]
 	if !ok {
+		a.mutex.Unlock()
 		return fmt.Errorf(`stream "%s" not found`, stream.ID)
 	}
 	if ongoingStream.clients > 0 {
+		a.mutex.Unlock()
 		return fmt.Errorf(`stream "%s" has clients`, stream.ID)
 	}
 
-	// Remove the stream from the list
-	defer delete(a.streams, stream.ID)
+	// Remove the stream from the list while holding the lock
+	delete(a.streams, stream.ID)
+	a.mutex.Unlock()
+
 	slog.Debug("Stopping stream", "stream", stream.ID)
-	// Close the stream
-	if err := CloseStream(stream); err != nil {
-		slog.Debug("Error closing stream", "error", err)
-		return err
-	}
+
+	// Close writers and player synchronously so the copier exits immediately
+	ongoingStream.writers.Close()
 	if ongoingStream.player != nil {
 		slog.Debug("Closing player", "stream", stream.ID)
 		ongoingStream.player.Body.Close()
 	}
 
-	// Close the `done' channel (safe for concurrent callers via sync.Once)
+	// Backend cleanup can take time; we already released the mutex
+	if err := CloseStream(stream); err != nil {
+		slog.Debug("Error closing stream", "error", err)
+	}
+
 	ongoingStream.closeDone.Do(func() {
 		close(ongoingStream.done)
 		slog.Debug("Stream done", "stream", stream.ID)
 	})
+
 	return nil
 }
 
 // Finishes a stream. The stream is removed from the AceStream backend. If the stream is not
 // enqueued, an error is returned. If the stream has clients reproducing it, the stream is not
-// removed. The stream is identified by the “id“ identifier.
+// removed. The stream is identified by the "id" identifier.
 func (a *Acexy) StopStream(stream *AceStream, out io.Writer) error {
 	a.mutex.Lock()
-	defer a.mutex.Unlock()
 
 	// Get the ongoing stream
 	ongoingStream, ok := a.streams[stream.ID]
 	if !ok {
+		a.mutex.Unlock()
 		slog.Debug("Stream not found", "stream", stream.ID)
 		return fmt.Errorf(`stream "%s" not found`, stream.ID)
 	}
@@ -350,6 +371,7 @@ func (a *Acexy) StopStream(stream *AceStream, out io.Writer) error {
 	// decrement to avoid double-counting.
 	if _, wasEvicted := ongoingStream.evicted[out]; wasEvicted {
 		delete(ongoingStream.evicted, out)
+		a.mutex.Unlock()
 		slog.Debug("Writer was already evicted, skipping decrement", "stream", stream.ID)
 		return nil
 	}
@@ -363,7 +385,10 @@ func (a *Acexy) StopStream(stream *AceStream, out io.Writer) error {
 	}
 
 	// Check if we have to stop the stream
-	if ongoingStream.clients == 0 {
+	shouldRelease := ongoingStream.clients == 0
+	a.mutex.Unlock()
+
+	if shouldRelease {
 		if err := a.releaseStream(stream); err != nil {
 			slog.Warn("Error releasing stream", "error", err)
 			return err
