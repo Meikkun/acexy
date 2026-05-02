@@ -262,7 +262,7 @@ adjustable by using environment variables.
         This must be as low as possible unless your Internet connection is really bad
         (ie: You have very big latencies).
       </th>
-      <th><code>1s</code></th>
+      <th><code>10s</code></th>
     <tr>
   </tbody>
 </table>
