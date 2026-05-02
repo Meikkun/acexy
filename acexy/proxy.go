@@ -107,12 +107,14 @@ func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 	pr, pw := io.Pipe()
 
 	slog.Debug("Starting stream", "path", r.URL.Path, "id", aceId)
+	streamStarted := false
 	if err := p.Acexy.StartStream(stream, pw); err != nil {
 		pw.Close()
 		slog.Error("Failed to start stream", "stream", aceId, "error", err)
 		http.Error(w, "Failed to start stream: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	streamStarted = true
 
 	// Goroutine: copy pipe reader -> ResponseWriter (only this goroutine touches w)
 	doneCopy := make(chan struct{})
@@ -135,13 +137,17 @@ func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 			<-timedOut
 			p.Acexy.StopStream(stream, pw)
 			pw.Close()
-			<-doneCopy
+			if streamStarted {
+				<-doneCopy
+			}
 		}()
 	case acexy.MPEG_TS_ENDPOINT:
 		defer func() {
 			p.Acexy.StopStream(stream, pw)
 			pw.Close()
-			<-doneCopy
+			if streamStarted {
+				<-doneCopy
+			}
 		}()
 	}
 
