@@ -97,8 +97,9 @@ variable**.
 > **NOTE**: The HLS mode - `ACEXY_M3U8` or `-m3u8` flag - is in a non-tested
 > status. Using it is discouraged and not guaranteed to work.
 
-There is a single available endpoint: `/ace/getstream` which takes the same
-parameters as the standard
+There are two available endpoints:
+
+* **`/ace/getstream`** - takes the same parameters as the standard
 [AceStream Middleware/HTTP API](https://docs.acestream.net/developers/api-reference/). Therefore,
 for running a stream, just open the following link in your preferred application - such as VLC:
 
@@ -106,8 +107,20 @@ for running a stream, just open the following link in your preferred application
 http://127.0.0.1:8080/ace/getstream?id=dd1e67078381739d14beca697356ab76d49d1a2
 ```
 
-where `dd1e67078381739d14beca697356ab76d49d1a2` is the ID of the AceStream 
+where `dd1e67078381739d14beca697356ab76d49d1a2` is the ID of the AceStream
 channel.
+
+* **`/ace/status`** - returns the current status of the proxy. You can query the
+status of a specific stream by providing the `id` or `infohash` parameter, or
+get the global status by omitting both. **Note**: providing both `id` and
+`infohash` at the same time, or providing empty values, will result in a
+`400 Bad Request` response.
+
+### Environment Variables
+
+Environment variables can be used to configure the proxy. If an environment
+variable contains an invalid value (e.g. a non-numeric value for a numeric
+setting), the proxy will **fall back to the default value** instead of crashing.
 
 ## Optimizing 🚀
 
