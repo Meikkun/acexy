@@ -103,9 +103,13 @@ func (pmw *PMultiWriter) SetOnEvict(fn func(io.Writer)) {
 	pmw.onEvict = fn
 }
 
-// evict removes a writer from the list and fires the OnEvict callback if set.
+// evict removes a writer from the list, closes it if possible, and fires the
+// OnEvict callback if set.
 func (pmw *PMultiWriter) evict(w io.Writer) {
 	pmw.Remove(w)
+	if c, ok := w.(io.Closer); ok {
+		c.Close()
+	}
 	pmw.RLock()
 	fn := pmw.onEvict
 	pmw.RUnlock()
@@ -147,7 +151,7 @@ func (pmw *PMultiWriter) Write(p []byte) (n int, err error) {
 			case err := <-done:
 				results <- writeResult{w: w, err: err}
 			case <-time.After(pmw.writeTimeout):
-				slog.Warn("writer timed out, evicting", "writer", w)
+				slog.Warn("writer timed out, evicting", "writer_type", fmt.Sprintf("%T", w))
 				results <- writeResult{w: w, err: context.DeadlineExceeded}
 				go pmw.evict(w)
 			case <-pmw.closed:
@@ -164,11 +168,11 @@ func (pmw *PMultiWriter) Write(p []byte) (n int, err error) {
 	for range writers {
 		select {
 		case <-pmw.closed:
-			slog.Debug("closed pmw", "pmw", pmw)
+			slog.Debug("closed pmw")
 			return 0, io.ErrClosedPipe
 		case res := <-results:
 			if res.err != nil {
-				slog.Debug("writer failed", "writer", res.w, "error", res.err)
+				slog.Debug("writer failed", "writer_type", fmt.Sprintf("%T", res.w), "error", res.err)
 				writeErrors = append(writeErrors, res.err)
 			} else {
 				successCount++

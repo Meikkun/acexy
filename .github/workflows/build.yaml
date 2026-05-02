@@ -20,11 +20,14 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
       - name: Install dependencies
-        run: go get .
+        run: go mod download
       - name: Build
         run: go build -v ./...
       - name: Test
-        run: go test -v ./... -json | tee TestResults-${{ matrix.go-version }}.json
+        shell: bash
+        run: set -o pipefail && go test -v ./... -json | tee TestResults-${{ matrix.go-version }}.json
+      - name: Test with race detector
+        run: go test -race ./...
       - name: Upload test results
         uses: actions/upload-artifact@v4
         with:

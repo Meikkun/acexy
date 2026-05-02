@@ -9,11 +9,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"javinator9889/acexy/lib/acexy"
 	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -91,56 +93,86 @@ func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set response headers BEFORE starting the stream. Once StartStream is called,
-	// the copier can immediately begin writing to the ResponseWriter from another
-	// goroutine. Header map writes are safe before the first Write/WriteHeader call.
-	// We intentionally do NOT call WriteHeader here — Go's HTTP server calls it
-	// implicitly on the first Write, and keeping it implicit means we can still
-	// return an HTTP error if StartStream fails.
+	// Set response headers BEFORE starting the stream. Header map writes are safe
+	// before the first Write/WriteHeader call. We intentionally do NOT call
+	// WriteHeader here — Go's HTTP server calls it implicitly on the first Write.
 	switch p.Acexy.Endpoint {
 	case acexy.M3U8_ENDPOINT:
 		w.Header().Set("Content-Type", "application/x-mpegURL")
 	case acexy.MPEG_TS_ENDPOINT:
 		w.Header().Set("Content-Type", "video/MP2T")
-		w.Header().Set("Transfer-Encoding", "chunked")
 	}
 
-	// Start playing the stream. The `StartStream` will dump the contents of the new or
-	// existing stream to the client. It takes an interface of `io.Writer` to write the stream
-	// contents to. The `http.ResponseWriter` implements the `io.Writer` interface, so we can
-	// pass it directly.
+	// Create a pipe so that PMultiWriter writes to the pipe writer (safe cross-goroutine)
+	// and the HTTP handler goroutine copies from the pipe reader to ResponseWriter.
+	pr, pw := io.Pipe()
+
 	slog.Debug("Starting stream", "path", r.URL.Path, "id", aceId)
-	if err := p.Acexy.StartStream(stream, w); err != nil {
+	streamStarted := false
+	if err := p.Acexy.StartStream(stream, pw); err != nil {
+		pw.Close()
 		slog.Error("Failed to start stream", "stream", aceId, "error", err)
 		http.Error(w, "Failed to start stream: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	streamStarted = true
 
-	// Defer the stream finish. This will be called when the request is done. When in M3U8 mode,
-	// the client connects directly to a subset of endpoints, so we are blind to what the client
-	// is doing. However, it periodically polls the M3U8 list to verify nothing has changed,
-	// simulating a new connection. Therefore, we can accumulate a lot of open streams and let
-	// the timeout finish them.
-	//
-	// When in MPEG-TS mode, the client connects to the endpoint and waits for the stream to finish.
-	// This is a blocking operation, so we can finish the stream when the client disconnects.
+	// Goroutine: copy pipe reader -> ResponseWriter (only this goroutine touches w)
+	doneCopy := make(chan struct{})
+	go func() {
+		defer close(doneCopy)
+		_, err := io.Copy(w, pr)
+		if err != nil {
+			slog.Debug("Client copy error", "stream", aceId, "error", err)
+		}
+		pr.Close() // ensure cleanup
+	}()
+
+	// Defer cleanup: stop stream, close pipe writer, and wait for copy goroutine
+	// to finish before returning. This prevents races between net/http request
+	// teardown and our background writes to ResponseWriter.
 	switch p.Acexy.Endpoint {
 	case acexy.M3U8_ENDPOINT:
-		timedOut := acexy.SetTimeout(streamTimeout)
+		var cleanupOnce sync.Once
+		cleanup := func() {
+			cleanupOnce.Do(func() {
+				p.Acexy.StopStream(stream, pw)
+				pw.Close()
+			})
+		}
+		timer := time.AfterFunc(streamTimeout, cleanup)
 		defer func() {
-			<-timedOut
-			p.Acexy.StopStream(stream, w)
+			if !timer.Stop() {
+				// Timer already fired; wait for copy goroutine to finish.
+				if streamStarted {
+					<-doneCopy
+				}
+				return
+			}
+			// Timer stopped before firing; run cleanup now.
+			cleanup()
+			if streamStarted {
+				<-doneCopy
+			}
 		}()
 	case acexy.MPEG_TS_ENDPOINT:
-		defer p.Acexy.StopStream(stream, w)
+		defer func() {
+			p.Acexy.StopStream(stream, pw)
+			pw.Close()
+			if streamStarted {
+				<-doneCopy
+			}
+		}()
 	}
 
-	// And wait for the client to disconnect
+	// Wait for client disconnect, stream finish, or copy goroutine done
 	select {
 	case <-r.Context().Done():
 		slog.Debug("Client disconnected", "path", r.URL.Path)
 	case <-p.Acexy.WaitStream(stream):
 		slog.Debug("Stream finished", "path", r.URL.Path)
+	case <-doneCopy:
+		slog.Debug("Client copy done", "path", r.URL.Path)
 	}
 }
 
@@ -151,35 +183,58 @@ func (p *Proxy) HandleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var aceId *acexy.AceID
 	q := r.URL.Query()
 	slog.Debug("Status request", "path", r.URL.Path, "query", q)
-	id, err := acexy.NewAceID(q.Get("id"), q.Get("infohash"))
-	if err == nil {
-		aceId = &id
-	} else {
-		// If no parameter is included, ask for the global status
-		aceId = nil
+
+	hasID := q.Has("id")
+	hasInfohash := q.Has("infohash")
+	idVal := q.Get("id")
+	infohashVal := q.Get("infohash")
+
+	// No parameters => global status
+	if !hasID && !hasInfohash {
+		status, err := p.Acexy.GetStatus(nil)
+		if err != nil {
+			slog.Error("Failed to get status", "error", err)
+			http.Error(w, "Stream not found", http.StatusNotFound)
+			return
+		}
+		writeStatusJSON(w, status)
+		return
 	}
 
-	// Get the status of the stream
-	slog.Debug("Getting status", "id", aceId)
-	status, err := p.Acexy.GetStatus(aceId)
+	// Both provided, or one provided but empty => bad request
+	if (hasID && hasInfohash) || (hasID && idVal == "") || (hasInfohash && infohashVal == "") {
+		slog.Error("Invalid status query parameters", "id", idVal, "infohash", infohashVal)
+		http.Error(w, "Invalid query parameters: provide exactly one of id or infohash", http.StatusBadRequest)
+		return
+	}
+
+	aceId, err := acexy.NewAceID(idVal, infohashVal)
+	if err != nil {
+		slog.Error("Invalid status query parameters", "error", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	status, err := p.Acexy.GetStatus(&aceId)
 	if err != nil {
 		slog.Error("Failed to get status", "error", err)
 		http.Error(w, "Stream not found", http.StatusNotFound)
 		return
 	}
 
+	writeStatusJSON(w, status)
+}
+
+func writeStatusJSON(w http.ResponseWriter, status acexy.AcexyStatus) {
 	slog.Debug("Status", "status", status)
-	// Write the status to the client as JSON
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 
 	if err := json.NewEncoder(w).Encode(status); err != nil {
 		slog.Error("Failed to write status", "error", err)
 		http.Error(w, "Failed to write status", http.StatusInternalServerError)
-		return
 	}
 }
 
@@ -194,8 +249,8 @@ func LookupEnvOrInt(key string, def int) int {
 	if val, ok := os.LookupEnv(key); ok {
 		i, err := strconv.Atoi(val)
 		if err != nil {
-			slog.Error("Failed to parse environment variable", "key", key, "value", val)
-			return 0
+			slog.Warn("Failed to parse environment variable, using default", "key", key, "value", val, "default", def)
+			return def
 		}
 		return i
 	}
@@ -206,8 +261,8 @@ func LookupEnvOrDuration(key string, def time.Duration) time.Duration {
 	if val, ok := os.LookupEnv(key); ok {
 		d, err := time.ParseDuration(val)
 		if err != nil {
-			slog.Error("Failed to parse environment variable", "key", key, "value", val)
-			return 0
+			slog.Warn("Failed to parse environment variable, using default", "key", key, "value", val, "default", def)
+			return def
 		}
 		return d
 	}
@@ -218,8 +273,8 @@ func LookupEnvOrBool(key string, def bool) bool {
 	if val, ok := os.LookupEnv(key); ok {
 		b, err := strconv.ParseBool(val)
 		if err != nil {
-			slog.Error("Failed to parse environment variable", "key", key, "value", val)
-			return false
+			slog.Warn("Failed to parse environment variable, using default", "key", key, "value", val, "default", def)
+			return def
 		}
 		return b
 	}
@@ -240,15 +295,14 @@ func LookupLogLevel() slog.Level {
 }
 
 func LookupEnvOrSize(key string, def uint64) *Size {
+	s := &Size{Bytes: def}
 	if val, ok := os.LookupEnv(key); ok {
-		if err := size.Set(val); err != nil {
-			slog.Error("Failed to parse environment variable", "key", key, "value", val)
-			return nil
+		if err := s.Set(val); err != nil {
+			slog.Warn("Failed to parse environment variable, using default", "key", key, "value", val, "default", def)
+			s.Bytes = def
 		}
-	} else {
-		size.Bytes = def
 	}
-	return &size
+	return s
 }
 
 func (s *Size) Set(value string) error {
