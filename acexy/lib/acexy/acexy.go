@@ -64,14 +64,14 @@ type AceStream struct {
 }
 
 type ongoingStream struct {
-	clients  uint
-	done     chan struct{}
+	clients   uint
+	done      chan struct{}
 	closeDone sync.Once // guards close(done) against concurrent callers
-	player   *http.Response
-	stream   *AceStream
-	copier   *Copier
-	writers  *pmw.PMultiWriter
-	evicted  map[io.Writer]struct{} // writers evicted by PMultiWriter timeout
+	player    *http.Response
+	stream    *AceStream
+	copier    *Copier
+	writers   *pmw.PMultiWriter
+	evicted   map[io.Writer]struct{} // writers evicted by PMultiWriter timeout
 }
 
 // Structure referencing the AceStream Proxy - this is, ourselves
@@ -310,7 +310,7 @@ func (a *Acexy) StartStream(stream *AceStream, out io.Writer) error {
 // If the stream is not enqueued, an error is returned. If the stream has clients reproducing it,
 // the stream is not removed. The stream is identified by the "id" identifier.
 //
-	// This function acquires the mutex internally. Callers must NOT hold the mutex.
+// This function acquires the mutex internally. Callers must NOT hold the mutex.
 func (a *Acexy) releaseStream(stream *AceStream) error {
 	a.mutex.Lock()
 	ongoingStream, ok := a.streams[stream.ID]
