@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"javinator9889/acexy/lib/acexy"
 	"log/slog"
 	"net/http"
@@ -319,6 +320,120 @@ func TestMultiClientStreamSurvival(t *testing.T) {
 	cancelA()
 	totalBytes := <-bytesReadA
 	t.Logf("Client A read %d bytes total - stream survived slow consumer eviction", totalBytes)
+
+	if totalBytes == 0 {
+		t.Fatal("Client A read 0 bytes - stream was not working")
+	}
+}
+
+// TestSlowClientDoesNotBlockHealthyClient proves that a slow client cannot
+// freeze video delivery for healthy clients when using the Broadcaster
+// architecture. Client B never reads and is evicted by queue fullness,
+// while Client A continues receiving data uninterrupted.
+func TestSlowClientDoesNotBlockHealthyClient(t *testing.T) {
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, opts)))
+
+	backend := startMockBackend()
+	defer backend.Close()
+
+	backendURL, _ := url.Parse(backend.URL)
+
+	a := &acexy.Acexy{
+		Scheme:            "http",
+		Host:              backendURL.Hostname(),
+		Port:              mustParseInt(backendURL.Port()),
+		Endpoint:          acexy.MPEG_TS_ENDPOINT,
+		EmptyTimeout:      10 * time.Second,
+		BufferSize:        1024,
+		NoResponseTimeout: 2 * time.Second,
+		ClientQueueSize:   128, // bounded, but large enough for a healthy client to drain
+	}
+	a.Init()
+
+	proxy := &Proxy{Acexy: a}
+	proxyServer := httptest.NewServer(proxy)
+	defer proxyServer.Close()
+
+	streamID := "slow-client-test"
+
+	// Client A: healthy reader
+	clientA := &http.Client{Transport: &http.Transport{}}
+	respA, err := clientA.Get(proxyServer.URL + "/ace/getstream?id=" + streamID)
+	if err != nil {
+		t.Fatalf("Client A failed to connect: %v", err)
+	}
+	defer respA.Body.Close()
+
+	bytesReadA := make(chan int64, 1)
+	clientAErr := make(chan error, 1)
+	ctx, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	go func() {
+		buf := make([]byte, 4096)
+		var total int64
+		for {
+			select {
+			case <-ctx.Done():
+				bytesReadA <- total
+				return
+			default:
+			}
+			n, err := respA.Body.Read(buf)
+			total += int64(n)
+			if err != nil {
+				clientAErr <- err
+				bytesReadA <- total
+				return
+			}
+		}
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Client B: never reads
+	clientB := &http.Client{Transport: &http.Transport{}}
+	respB, err := clientB.Get(proxyServer.URL + "/ace/getstream?id=" + streamID)
+	if err != nil {
+		t.Fatalf("Client B failed to connect: %v", err)
+	}
+	// Do NOT read from respB.Body
+
+	// Wait for Client B to be evicted, then drain its response body to observe
+	// the server-side close. Reading earlier would make this a healthy client.
+	time.Sleep(3 * time.Second)
+	evictedB := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, respB.Body)
+		evictedB <- err
+	}()
+
+	select {
+	case <-evictedB:
+	case <-time.After(3 * time.Second):
+		respB.Body.Close()
+		t.Fatal("Client B was not evicted")
+	}
+
+	// Verify Client A is still alive
+	select {
+	case err := <-clientAErr:
+		t.Fatalf("Client A got an error after slow client eviction: %v", err)
+	default:
+	}
+
+	// Let Client A read a bit more
+	time.Sleep(2 * time.Second)
+
+	select {
+	case err := <-clientAErr:
+		t.Fatalf("Client A got an error after continued reading: %v", err)
+	default:
+	}
+
+	cancelA()
+	totalBytes := <-bytesReadA
+	t.Logf("Client A read %d bytes total - slow client did not block healthy client", totalBytes)
 
 	if totalBytes == 0 {
 		t.Fatal("Client A read 0 bytes - stream was not working")

@@ -50,6 +50,9 @@ import (
 // to all the provided writers, similar to the Unix tee(1) command. Writers can be
 // added and removed dynamically after creation. Each write is done in a separate
 // goroutine, so the writes are done in parallel.
+//
+// PMultiWriter is retained for compatibility and package tests, but live stream
+// fanout uses acexy.Broadcaster so slow clients cannot block backend writes.
 type PMultiWriter struct {
 	sync.RWMutex
 	writers      []io.Writer
@@ -143,7 +146,16 @@ func (pmw *PMultiWriter) Write(p []byte) (n int, err error) {
 		go func(w io.Writer) {
 			done := make(chan error, 1)
 			go func() {
-				_, err := w.Write(p)
+				n, err := w.Write(p)
+				if err == nil && n != len(p) {
+					slog.Warn(
+						"writer short write",
+						"writer_type", fmt.Sprintf("%T", w),
+						"written", n,
+						"expected", len(p),
+					)
+					err = io.ErrShortWrite
+				}
 				done <- err
 			}()
 
@@ -151,13 +163,23 @@ func (pmw *PMultiWriter) Write(p []byte) (n int, err error) {
 			case err := <-done:
 				results <- writeResult{w: w, err: err}
 			case <-time.After(pmw.writeTimeout):
-				slog.Warn("writer timed out, evicting", "writer_type", fmt.Sprintf("%T", w))
+				slog.Warn(
+					"writer timed out, evicting",
+					"writer_type", fmt.Sprintf("%T", w),
+					"chunk_size", len(p),
+					"timeout", pmw.writeTimeout,
+				)
 				results <- writeResult{w: w, err: context.DeadlineExceeded}
 				go pmw.evict(w)
+				// Wait for the inner write goroutine to finish before returning,
+				// so the caller can safely reuse the byte slice.
+				<-done
 			case <-pmw.closed:
 				results <- writeResult{w: w, err: io.ErrClosedPipe}
+				<-done
 			case <-pmw.ctx.Done():
 				results <- writeResult{w: w, err: pmw.ctx.Err()}
+				<-done
 			}
 		}(w)
 	}

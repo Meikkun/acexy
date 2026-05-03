@@ -262,10 +262,12 @@ adjustable by using environment variables.
       <th><code>-buffer-size</code></th>
       <th><code>ACEXY_BUFFER_SIZE</code></th>
       <th>
-        Buffers up-to <code>buffer-size</code> bytes of a stream before copying the data to the
-        player. Useful to have better stability during plays.
+        <b>Deprecated</b>. Older versions used this as a server-side output aggregation buffer.
+        That caused large burst writes and could destabilize live MPEG-TS playback. Acexy now
+        streams using small TS-aligned chunks and relies on the player buffer for playback smoothing.
+        The flag is accepted for compatibility but no longer controls streaming output buffering.
       </th>
-      <th><code>4.2MiB</code></th>
+      <th><code>4.2MiB</code> (ignored)</th>
     <tr>
     <tr>
       <th><code>-no-response-timeout</code></th>
@@ -277,8 +279,36 @@ adjustable by using environment variables.
       </th>
       <th><code>10s</code></th>
     <tr>
+    <tr>
+      <th><code>-write-timeout</code></th>
+      <th><code>ACEXY_WRITE_TIMEOUT</code></th>
+      <th>
+        Controls how long a client writer may block before being evicted.
+        Lower values remove slow clients faster. Higher values tolerate slow clients longer.
+      </th>
+      <th><code>5s</code></th>
+    <tr>
+    <tr>
+      <th><code>-client-queue-size</code></th>
+      <th><code>ACEXY_CLIENT_QUEUE_SIZE</code></th>
+      <th>
+        Per-client queue size for the stream broadcaster.
+        Larger values tolerate slower clients but use more memory.
+        Each queue entry holds one TS-aligned chunk (~48KB).
+        A queue size of 64 uses approximately 3MB per client.
+      </th>
+      <th><code>64</code></th>
+    <tr>
   </tbody>
 </table>
+
+> **Streaming Behavior**: Acexy does not use a large server-side playback buffer.
+> Large output buffers caused burst writes and could destabilize live MPEG-TS playback.
+> Acexy forwards stream data in small TS-aligned chunks (~48KB) and isolates slow clients
+> using per-client bounded queues. Player buffering should be configured in the player,
+> not in Acexy.
+>
+> `ACEXY_BUFFER_SIZE` is deprecated and no longer controls streaming output buffering.
 
 > **NOTE**: The list of options is extensive but could be outdated. Always refer to the
 > Acexy binary `-help` output when in doubt.

@@ -31,6 +31,8 @@ var (
 	emptyTimeout      time.Duration
 	size              Size
 	noResponseTimeout time.Duration
+	writeTimeout      time.Duration
+	clientQueueSize   int
 )
 
 //go:embed LICENSE.short
@@ -128,9 +130,8 @@ func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 		pr.Close() // ensure cleanup
 	}()
 
-	// Defer cleanup: stop stream, close pipe writer, and wait for copy goroutine
-	// to finish before returning. This prevents races between net/http request
-	// teardown and our background writes to ResponseWriter.
+	// Defer cleanup: stop stream, close pipe writer, and wait for copy goroutine to finish
+	// before returning. This prevents races between net/http request teardown and our background writes to ResponseWriter.
 	switch p.Acexy.Endpoint {
 	case acexy.M3U8_ENDPOINT:
 		var cleanupOnce sync.Once
@@ -369,10 +370,13 @@ func parseArgs() {
 		"timeout in human-readable format to finish the stream when the source is empty. "+
 			"Can be set with ACEXY_EMPTY_TIMEOUT environment variable",
 	)
+	if _, ok := os.LookupEnv("ACEXY_BUFFER_SIZE"); ok {
+		slog.Warn("ACEXY_BUFFER_SIZE is deprecated and no longer controls streaming output buffering")
+	}
 	flag.Var(
 		LookupEnvOrSize("ACEXY_BUFFER_SIZE", 4*1024*1024),
 		"buffer-size",
-		"buffer size in human-readable format to use when copying the data. "+
+		"Deprecated: no longer controls streaming output buffering. "+
 			"Can be set with ACEXY_BUFFER_SIZE environment variable",
 	)
 	flag.DurationVar(
@@ -382,6 +386,22 @@ func parseArgs() {
 		"timeout in human-readable format to wait for a response from the AceStream middleware. "+
 			"Can be set with ACEXY_NO_RESPONSE_TIMEOUT environment variable. "+
 			"Depending on the network conditions, you may want to adjust this value",
+	)
+	flag.DurationVar(
+		&writeTimeout,
+		"write-timeout",
+		LookupEnvOrDuration("ACEXY_WRITE_TIMEOUT", 5*time.Second),
+		"timeout for writing to a client before eviction. "+
+			"Lower values remove slow clients faster. Higher values tolerate slow clients longer. "+
+			"Can be set with ACEXY_WRITE_TIMEOUT environment variable",
+	)
+	flag.IntVar(
+		&clientQueueSize,
+		"client-queue-size",
+		LookupEnvOrInt("ACEXY_CLIENT_QUEUE_SIZE", 64),
+		"per-client queue size for the stream broadcaster. "+
+			"Larger values tolerate slower clients but use more memory. "+
+			"Can be set with ACEXY_CLIENT_QUEUE_SIZE environment variable",
 	)
 	flag.Parse()
 }
@@ -407,6 +427,8 @@ func main() {
 		EmptyTimeout:      emptyTimeout,
 		BufferSize:        int(size.Bytes),
 		NoResponseTimeout: noResponseTimeout,
+		WriteTimeout:      writeTimeout,
+		ClientQueueSize:   clientQueueSize,
 	}
 	acexy.Init()
 	slog.Debug("Acexy", "acexy", acexy)
