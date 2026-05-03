@@ -47,3 +47,11 @@ func TestLookupLogLevel_InvalidUsesInfo(t *testing.T) {
 		t.Errorf("expected LevelInfo(0), got %v", result)
 	}
 }
+
+func TestLookupEnvOrDuration_WriteTimeoutInvalidFallsBack(t *testing.T) {
+	t.Setenv("ACEXY_WRITE_TIMEOUT", "notaduration")
+	result := LookupEnvOrDuration("ACEXY_WRITE_TIMEOUT", 5*time.Second)
+	if result != 5*time.Second {
+		t.Errorf("expected default 5s, got %v", result)
+	}
+}

@@ -262,10 +262,12 @@ adjustable by using environment variables.
       <th><code>-buffer-size</code></th>
       <th><code>ACEXY_BUFFER_SIZE</code></th>
       <th>
-        Buffers up-to <code>buffer-size</code> bytes of a stream before copying the data to the
-        player. Useful to have better stability during plays.
+        <b>Deprecated</b>. Older versions used this as a server-side output aggregation buffer.
+        That caused large burst writes and could destabilize live MPEG-TS playback. Acexy now
+        streams using small TS-aligned chunks and relies on the player buffer for playback smoothing.
+        The flag is accepted for compatibility but no longer controls streaming output buffering.
       </th>
-      <th><code>4.2MiB</code></th>
+      <th><code>4.2MiB</code> (ignored)</th>
     <tr>
     <tr>
       <th><code>-no-response-timeout</code></th>
@@ -276,6 +278,15 @@ adjustable by using environment variables.
         (ie: You have very big latencies).
       </th>
       <th><code>10s</code></th>
+    <tr>
+    <tr>
+      <th><code>-write-timeout</code></th>
+      <th><code>ACEXY_WRITE_TIMEOUT</code></th>
+      <th>
+        Controls how long a client writer may block before being evicted.
+        Lower values remove slow clients faster. Higher values tolerate slow clients longer.
+      </th>
+      <th><code>5s</code></th>
     <tr>
   </tbody>
 </table>

@@ -81,8 +81,9 @@ type Acexy struct {
 	Port              int           // The port to be used when connecting to the AceStream middleware
 	Endpoint          AcexyEndpoint // The endpoint to be used when connecting to the AceStream middleware
 	EmptyTimeout      time.Duration // Timeout after which, if no data is written, the stream is closed
-	BufferSize        int           // The buffer size to use when copying the data
+	BufferSize        int           // Deprecated: no longer controls streaming output buffering
 	NoResponseTimeout time.Duration // Timeout to wait for a response from the AceStream middleware
+	WriteTimeout      time.Duration // Timeout for writing to a client before eviction
 
 	// Information about ongoing streams
 	streams    map[AceID]*ongoingStream
@@ -170,7 +171,11 @@ func (a *Acexy) FetchStream(aceId AceID, extraParams url.Values) (*AceStream, er
 		ID:          aceId,
 	}
 
-	writers := pmw.New(context.Background(), 5*time.Second)
+	writeTimeout := a.WriteTimeout
+	if writeTimeout <= 0 {
+		writeTimeout = 5 * time.Second
+	}
+	writers := pmw.New(context.Background(), writeTimeout)
 	os := &ongoingStream{
 		clients: 0,
 		done:    make(chan struct{}),
