@@ -46,10 +46,22 @@ type AceStreamCommand struct {
 }
 
 type AcexyStatus struct {
-	Clients *uint  `json:"clients,omitempty"`
-	Streams *uint  `json:"streams,omitempty"`
-	ID      *AceID `json:"stream_id,omitempty"`
-	StatURL string `json:"stat_url,omitempty"`
+	Clients               *uint  `json:"clients,omitempty"`
+	Streams               *uint  `json:"streams,omitempty"`
+	ID                    *AceID `json:"stream_id,omitempty"`
+	StatURL               string `json:"stat_url,omitempty"`
+	MaxConnections        int    `json:"max_connections,omitempty"`
+	MaxConcurrentChannels int    `json:"max_concurrent_channels,omitempty"`
+	TotalClients          *uint  `json:"total_clients,omitempty"`
+}
+
+// ErrLimitReached indicates a connection or channel limit has been reached.
+type ErrLimitReached struct {
+	Message string
+}
+
+func (e *ErrLimitReached) Error() string {
+	return e.Message
 }
 
 // The stream information is stored in a structure referencing the `AceStreamResponse`
@@ -74,15 +86,17 @@ type ongoingStream struct {
 
 // Structure referencing the AceStream Proxy - this is, ourselves
 type Acexy struct {
-	Scheme            string        // The scheme to be used when connecting to the AceStream middleware
-	Host              string        // The host to be used when connecting to the AceStream middleware
-	Port              int           // The port to be used when connecting to the AceStream middleware
-	Endpoint          AcexyEndpoint // The endpoint to be used when connecting to the AceStream middleware
-	EmptyTimeout      time.Duration // Timeout after which, if no data is written, the stream is closed
-	BufferSize        int           // Deprecated: no longer controls streaming output buffering
-	NoResponseTimeout time.Duration // Timeout to wait for a response from the AceStream middleware
-	WriteTimeout      time.Duration // Timeout for writing to a client before eviction
-	ClientQueueSize   int           // Per-client queue size for the broadcaster
+	Scheme                string        // The scheme to be used when connecting to the AceStream middleware
+	Host                  string        // The host to be used when connecting to the AceStream middleware
+	Port                  int           // The port to be used when connecting to the AceStream middleware
+	Endpoint              AcexyEndpoint // The endpoint to be used when connecting to the AceStream middleware
+	EmptyTimeout          time.Duration // Timeout after which, if no data is written, the stream is closed
+	BufferSize            int           // Deprecated: no longer controls streaming output buffering
+	NoResponseTimeout     time.Duration // Timeout to wait for a response from the AceStream middleware
+	WriteTimeout          time.Duration // Timeout for writing to a client before eviction
+	ClientQueueSize       int           // Per-client queue size for the broadcaster
+	MaxConnections        int           // Maximum concurrent streaming clients (0 = unlimited)
+	MaxConcurrentChannels int           // Maximum distinct broadcasts (0 = unlimited)
 
 	// Information about ongoing streams
 	streams    map[AceID]*ongoingStream
@@ -126,11 +140,17 @@ func (a *Acexy) Init() {
 func (a *Acexy) FetchStream(aceId AceID, extraParams url.Values) (*AceStream, error) {
 	a.mutex.Lock()
 
-	// Check if the stream is already enqueued
+	// Check if the stream is already enqueued (reusing = no new channel)
 	if stream, ok := a.streams[aceId]; ok {
 		slog.Info("Reusing existing", "stream", aceId, "clients", stream.clients)
 		a.mutex.Unlock()
 		return stream.stream, nil
+	}
+
+	// Check channel limit before creating a new stream
+	if a.MaxConcurrentChannels > 0 && uint(len(a.streams)) >= uint(a.MaxConcurrentChannels) {
+		a.mutex.Unlock()
+		return nil, &ErrLimitReached{Message: fmt.Sprintf("maximum concurrent channels reached (%d active)", len(a.streams))}
 	}
 
 	// Release the mutex BEFORE the HTTP call to the AceStream backend.
@@ -534,8 +554,17 @@ func (a *Acexy) GetStatus(id *AceID) (AcexyStatus, error) {
 
 	// Return the global status if no ID is given
 	if id == nil {
+		totalClients := uint(0)
+		for _, s := range a.streams {
+			totalClients += s.clients
+		}
 		streams := uint(len(a.streams))
-		return AcexyStatus{Streams: &streams}, nil
+		return AcexyStatus{
+			Streams:               &streams,
+			TotalClients:          &totalClients,
+			MaxConnections:        a.MaxConnections,
+			MaxConcurrentChannels: a.MaxConcurrentChannels,
+		}, nil
 	}
 
 	// Check if the stream is already enqueued
@@ -548,4 +577,50 @@ func (a *Acexy) GetStatus(id *AceID) (AcexyStatus, error) {
 	}
 
 	return AcexyStatus{}, fmt.Errorf(`stream "%s" not found`, id)
+}
+
+// ClientCount returns the total number of active streaming clients across all streams.
+func (a *Acexy) ClientCount() uint {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	var count uint
+	for _, s := range a.streams {
+		count += s.clients
+	}
+	return count
+}
+
+// StreamCount returns the number of distinct active streams.
+func (a *Acexy) StreamCount() uint {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	return uint(len(a.streams))
+}
+
+// Shutdown releases all active streams and their backend sessions.
+// It must NOT be called while holding a.mutex.
+func (a *Acexy) Shutdown() {
+	a.mutex.Lock()
+	streams := make([]*ongoingStream, 0, len(a.streams))
+	for _, os := range a.streams {
+		streams = append(streams, os)
+	}
+	a.streams = make(map[AceID]*ongoingStream)
+	a.mutex.Unlock()
+
+	for _, os := range streams {
+		slog.Info("Shutting down stream", "stream", os.stream.ID)
+		os.broadcaster.Close()
+		if os.player != nil {
+			os.player.Body.Close()
+		}
+		if err := CloseStream(os.stream); err != nil {
+			slog.Debug("Error closing stream during shutdown", "error", err)
+		}
+		os.closeDone.Do(func() {
+			close(os.done)
+		})
+	}
 }

@@ -122,6 +122,18 @@ Environment variables can be used to configure the proxy. If an environment
 variable contains an invalid value (e.g. a non-numeric value for a numeric
 setting), the proxy will **fall back to the default value** instead of crashing.
 
+### Graceful Shutdown
+
+Acexy handles `SIGTERM` and `SIGINT` for graceful shutdown. When a shutdown
+signal is received:
+
+1. The HTTP listener is closed — no new connections are accepted.
+2. Active streaming handlers are allowed to finish within the shutdown timeout.
+3. All AceStream backend sessions are properly released (`method=stop`).
+
+In Docker Compose, running `docker compose down` sends `SIGTERM` to the
+container, triggering this graceful shutdown automatically.
+
 ## Optimizing 🚀
 
 The AceStream Engine running behind of the proxy has a number of ports that can
@@ -298,6 +310,31 @@ adjustable by using environment variables.
         A queue size of 64 uses approximately 3MB per client.
       </th>
       <th><code>64</code></th>
+    <tr>
+    <tr>
+      <th><code>-max-connections</code></th>
+      <th><code>ACEXY_MAX_CONNECTIONS</code></th>
+      <th>
+        Maximum number of concurrent streaming clients. 0 means unlimited.
+      </th>
+      <th><code>0</code> (unlimited)</th>
+    <tr>
+    <tr>
+      <th><code>-max-concurrent-channels</code></th>
+      <th><code>ACEXY_MAX_CONCURRENT_CHANNELS</code></th>
+      <th>
+        Maximum number of distinct AceStream broadcasts. 0 means unlimited.
+      </th>
+      <th><code>0</code> (unlimited)</th>
+    <tr>
+    <tr>
+      <th><code>-shutdown-timeout</code></th>
+      <th><code>ACEXY_SHUTDOWN_TIMEOUT</code></th>
+      <th>
+        Time to wait for graceful shutdown after receiving SIGTERM or SIGINT.
+        Active streams are drained and backend sessions are released within this timeout.
+      </th>
+      <th><code>10s</code></th>
     <tr>
   </tbody>
 </table>
