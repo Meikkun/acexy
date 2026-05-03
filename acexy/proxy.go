@@ -5,8 +5,10 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,25 +16,30 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/dustin/go-humanize"
 )
 
 var (
-	addr              string
-	scheme            string
-	host              string
-	port              int
-	streamTimeout     time.Duration
-	m3u8              bool
-	emptyTimeout      time.Duration
-	size              Size
-	noResponseTimeout time.Duration
-	writeTimeout      time.Duration
-	clientQueueSize   int
+	addr                  string
+	scheme                string
+	host                  string
+	port                  int
+	streamTimeout         time.Duration
+	m3u8                  bool
+	emptyTimeout          time.Duration
+	size                  Size
+	noResponseTimeout     time.Duration
+	writeTimeout          time.Duration
+	clientQueueSize       int
+	maxConnections        int
+	maxConcurrentChannels int
+	shutdownTimeout       time.Duration
 )
 
 //go:embed LICENSE.short
@@ -87,11 +94,31 @@ func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check connection limit before any backend work
+	if maxConnections > 0 {
+		current := p.Acexy.ClientCount()
+		if current >= uint(maxConnections) {
+			slog.Warn("Connection limit reached",
+				"current", current,
+				"max", maxConnections,
+				"client", r.RemoteAddr,
+			)
+			http.Error(w, "Maximum connections reached, try again later", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	// Gather the stream information
 	stream, err := p.Acexy.FetchStream(aceId, q)
 	if err != nil {
-		slog.Error("Failed to start stream", "stream", aceId, "error", err)
-		http.Error(w, "Failed to start stream: "+err.Error(), http.StatusInternalServerError)
+		var limitErr *acexy.ErrLimitReached
+		if errors.As(err, &limitErr) {
+			slog.Warn("Channel limit reached", "stream", aceId, "error", err)
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		} else {
+			slog.Error("Failed to start stream", "stream", aceId, "error", err)
+			http.Error(w, "Failed to start stream: "+err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 
@@ -403,6 +430,27 @@ func parseArgs() {
 			"Larger values tolerate slower clients but use more memory. "+
 			"Can be set with ACEXY_CLIENT_QUEUE_SIZE environment variable",
 	)
+	flag.IntVar(
+		&maxConnections,
+		"max-connections",
+		LookupEnvOrInt("ACEXY_MAX_CONNECTIONS", 0),
+		"maximum number of concurrent streaming clients. 0 means unlimited. "+
+			"Can be set with ACEXY_MAX_CONNECTIONS environment variable",
+	)
+	flag.IntVar(
+		&maxConcurrentChannels,
+		"max-concurrent-channels",
+		LookupEnvOrInt("ACEXY_MAX_CONCURRENT_CHANNELS", 0),
+		"maximum number of distinct AceStream broadcasts. 0 means unlimited. "+
+			"Can be set with ACEXY_MAX_CONCURRENT_CHANNELS environment variable",
+	)
+	flag.DurationVar(
+		&shutdownTimeout,
+		"shutdown-timeout",
+		LookupEnvOrDuration("ACEXY_SHUTDOWN_TIMEOUT", 10*time.Second),
+		"timeout for graceful shutdown after receiving SIGTERM/SIGINT. "+
+			"Can be set with ACEXY_SHUTDOWN_TIMEOUT environment variable",
+	)
 	flag.Parse()
 }
 
@@ -419,32 +467,59 @@ func main() {
 		endpoint = acexy.MPEG_TS_ENDPOINT
 	}
 	// Create a new Acexy instance
-	acexy := &acexy.Acexy{
-		Scheme:            scheme,
-		Host:              host,
-		Port:              port,
-		Endpoint:          endpoint,
-		EmptyTimeout:      emptyTimeout,
-		BufferSize:        int(size.Bytes),
-		NoResponseTimeout: noResponseTimeout,
-		WriteTimeout:      writeTimeout,
-		ClientQueueSize:   clientQueueSize,
+	acexyInstance := &acexy.Acexy{
+		Scheme:                scheme,
+		Host:                  host,
+		Port:                  port,
+		Endpoint:              endpoint,
+		EmptyTimeout:          emptyTimeout,
+		BufferSize:            int(size.Bytes),
+		NoResponseTimeout:     noResponseTimeout,
+		WriteTimeout:          writeTimeout,
+		ClientQueueSize:       clientQueueSize,
+		MaxConnections:        maxConnections,
+		MaxConcurrentChannels: maxConcurrentChannels,
 	}
-	acexy.Init()
-	slog.Debug("Acexy", "acexy", acexy)
+	acexyInstance.Init()
+	slog.Debug("Acexy", "acexy", acexyInstance)
 
 	// Create a new HTTP server
-	proxy := &Proxy{Acexy: acexy}
+	proxy := &Proxy{Acexy: acexyInstance}
 	mux := http.NewServeMux()
 	mux.Handle(APIv1_URL+"/getstream", proxy)
 	mux.Handle(APIv1_URL+"/getstream/", proxy)
 	mux.Handle(APIv1_URL+"/status", proxy)
 	mux.Handle("/", http.NotFoundHandler())
 
-	// Start the HTTP server
-	slog.Info("Starting server", "addr", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		slog.Error("Failed to start server", "error", err)
-		os.Exit(1)
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
 	}
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		slog.Info("Starting server", "addr", addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	sig := <-quit
+	slog.Info("Received signal, shutting down", "signal", sig)
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	// Step 1: Stop accepting new connections and wait for active HTTP handlers to return.
+	if err := server.Shutdown(ctx); err != nil {
+		slog.Error("Server shutdown error", "error", err)
+	}
+
+	// Step 2: Release all AceStream backend sessions.
+	acexyInstance.Shutdown()
+
+	slog.Info("Shutdown complete")
 }
