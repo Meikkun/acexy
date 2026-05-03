@@ -1,11 +1,16 @@
 package acexy
 
 import (
-	"bufio"
 	"io"
 	"log/slog"
 	"sync"
 	"time"
+)
+
+const (
+	MPEGTS_PACKET_SIZE       = 188
+	DEFAULT_COPY_PACKETS     = 256
+	DEFAULT_COPY_BUFFER_SIZE = MPEGTS_PACKET_SIZE * DEFAULT_COPY_PACKETS
 )
 
 // Copier is an implementation that copies the data from the source to the destination.
@@ -18,20 +23,21 @@ type Copier struct {
 	Source io.Reader
 	// The timeout to use when the source is empty.
 	EmptyTimeout time.Duration
-	// The buffer size to use when copying the data.
+	// BufferSize is deprecated. Streaming now uses a fixed TS-aligned copy buffer
+	// to avoid large downstream write bursts.
 	BufferSize int
 
 	/**! Private Data */
-	mu             sync.Mutex
-	timer          *time.Timer
-	bufferedWriter *bufio.Writer
-	closed         bool
+	mu     sync.Mutex
+	timer  *time.Timer
+	closed bool
 }
 
 // Starts copying the data from the source to the destination.
 func (c *Copier) Copy() error {
+	slog.Debug("copy started", "copy_buffer_size", DEFAULT_COPY_BUFFER_SIZE)
+
 	c.mu.Lock()
-	c.bufferedWriter = bufio.NewWriterSize(c.Destination, c.BufferSize)
 	c.timer = time.NewTimer(c.EmptyTimeout)
 	c.closed = false
 	c.mu.Unlock()
@@ -41,30 +47,13 @@ func (c *Copier) Copy() error {
 
 	go func() {
 		for {
-			c.mu.Lock()
-			if c.closed || c.timer == nil {
-				c.mu.Unlock()
-				return
-			}
-			if !c.timer.Stop() {
-				select {
-				case <-c.timer.C:
-				default:
-				}
-			}
-			c.timer.Reset(c.EmptyTimeout)
-			c.mu.Unlock()
-
 			select {
 			case <-done:
 				slog.Debug("Done copying")
 				return
 			case <-c.timer.C:
-				// On timeout, flush the buffer, and close both the source and the destination
+				// On timeout, close both the source and the destination
 				c.mu.Lock()
-				if c.bufferedWriter != nil {
-					c.bufferedWriter.Flush()
-				}
 				c.closed = true
 				c.mu.Unlock()
 				if closer, ok := c.Source.(io.Closer); ok {
@@ -82,13 +71,6 @@ func (c *Copier) Copy() error {
 
 	_, err := io.Copy(c, c.Source)
 
-	// Flush on normal completion
-	c.mu.Lock()
-	if !c.closed && c.bufferedWriter != nil {
-		c.bufferedWriter.Flush()
-	}
-	c.mu.Unlock()
-
 	return err
 }
 
@@ -97,9 +79,10 @@ func (c *Copier) Write(p []byte) (n int, err error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed || c.timer == nil || c.bufferedWriter == nil {
+	if c.closed || c.timer == nil {
+		c.mu.Unlock()
 		return 0, io.ErrClosedPipe
 	}
 	// Reset the timer safely under the mutex
@@ -110,6 +93,13 @@ func (c *Copier) Write(p []byte) (n int, err error) {
 		}
 	}
 	c.timer.Reset(c.EmptyTimeout)
-	// Write the data to the destination
-	return c.bufferedWriter.Write(p)
+	dst := c.Destination
+	c.mu.Unlock()
+
+	// Copy the data before passing it to the destination. Some destinations
+	// (e.g. io.Pipe) may hold a reference to the slice after Write returns,
+	// which would race with io.Copy reusing its buffer.
+	p2 := make([]byte, len(p))
+	copy(p2, p)
+	return dst.Write(p2)
 }

@@ -157,3 +157,66 @@ func TestNormalWrite(t *testing.T) {
 		t.Error("Both writers should have received data")
 	}
 }
+
+type shortWriter struct {
+	mu    sync.Mutex
+	wrote int
+}
+
+func (s *shortWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := len(p) / 2
+	s.wrote += n
+	return n, nil
+}
+
+func TestPMultiWriter_PartialWriteReturnsError(t *testing.T) {
+	short := &shortWriter{}
+	fast := &fastWriter{}
+
+	pmw := New(context.Background(), 1*time.Second, short, fast)
+
+	data := []byte("test data for partial write")
+	n, err := pmw.Write(data)
+
+	// At least one writer succeeded, so Write should return success
+	if err != nil {
+		t.Fatalf("Expected no error because fast writer succeeded, got: %v", err)
+	}
+	if n != len(data) {
+		t.Errorf("Expected n=%d, got %d", len(data), n)
+	}
+
+	// The short writer is NOT evicted on write errors (only on timeouts).
+	// Both writers should still be present.
+	pmw.RLock()
+	remaining := len(pmw.writers)
+	pmw.RUnlock()
+	if remaining != 2 {
+		t.Errorf("Expected 2 writers (short writes do not evict), got %d", remaining)
+	}
+}
+
+func TestPMultiWriter_AllPartialWritesReturnError(t *testing.T) {
+	short1 := &shortWriter{}
+	short2 := &shortWriter{}
+
+	pmw := New(context.Background(), 1*time.Second, short1, short2)
+
+	data := []byte("test data for all partial writes")
+	n, err := pmw.Write(data)
+
+	// All writers failed, so Write should return an error
+	if err == nil {
+		t.Fatal("Expected error when all writers short-write, got nil")
+	}
+	if n != 0 {
+		t.Errorf("Expected n=0 when all writers fail, got %d", n)
+	}
+
+	_, ok := err.(PMultiWriterError)
+	if !ok {
+		t.Errorf("Expected PMultiWriterError, got %T", err)
+	}
+}
