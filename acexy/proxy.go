@@ -32,6 +32,7 @@ var (
 	size              Size
 	noResponseTimeout time.Duration
 	writeTimeout      time.Duration
+	clientQueueSize   int
 )
 
 //go:embed LICENSE.short
@@ -394,6 +395,14 @@ func parseArgs() {
 			"Lower values remove slow clients faster. Higher values tolerate slow clients longer. "+
 			"Can be set with ACEXY_WRITE_TIMEOUT environment variable",
 	)
+	flag.IntVar(
+		&clientQueueSize,
+		"client-queue-size",
+		LookupEnvOrInt("ACEXY_CLIENT_QUEUE_SIZE", 64),
+		"per-client queue size for the stream broadcaster. "+
+			"Larger values tolerate slower clients but use more memory. "+
+			"Can be set with ACEXY_CLIENT_QUEUE_SIZE environment variable",
+	)
 	flag.Parse()
 }
 
@@ -419,6 +428,7 @@ func main() {
 		BufferSize:        int(size.Bytes),
 		NoResponseTimeout: noResponseTimeout,
 		WriteTimeout:      writeTimeout,
+		ClientQueueSize:   clientQueueSize,
 	}
 	acexy.Init()
 	slog.Debug("Acexy", "acexy", acexy)

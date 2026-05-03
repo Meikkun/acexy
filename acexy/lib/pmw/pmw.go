@@ -50,6 +50,9 @@ import (
 // to all the provided writers, similar to the Unix tee(1) command. Writers can be
 // added and removed dynamically after creation. Each write is done in a separate
 // goroutine, so the writes are done in parallel.
+//
+// PMultiWriter is retained for compatibility and package tests, but live stream
+// fanout uses acexy.Broadcaster so slow clients cannot block backend writes.
 type PMultiWriter struct {
 	sync.RWMutex
 	writers      []io.Writer

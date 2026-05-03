@@ -5,12 +5,10 @@
 package acexy
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"javinator9889/acexy/lib/pmw"
 	"log/slog"
 	"net"
 	"net/http"
@@ -64,14 +62,14 @@ type AceStream struct {
 }
 
 type ongoingStream struct {
-	clients   uint
-	done      chan struct{}
-	closeDone sync.Once // guards close(done) against concurrent callers
-	player    *http.Response
-	stream    *AceStream
-	copier    *Copier
-	writers   *pmw.PMultiWriter
-	evicted   map[io.Writer]struct{} // writers evicted by PMultiWriter timeout
+	clients     uint
+	done        chan struct{}
+	closeDone   sync.Once // guards close(done) against concurrent callers
+	player      *http.Response
+	stream      *AceStream
+	copier      *Copier
+	broadcaster *Broadcaster
+	evicted     map[io.Writer]struct{} // writers evicted by broadcaster
 }
 
 // Structure referencing the AceStream Proxy - this is, ourselves
@@ -84,6 +82,7 @@ type Acexy struct {
 	BufferSize        int           // Deprecated: no longer controls streaming output buffering
 	NoResponseTimeout time.Duration // Timeout to wait for a response from the AceStream middleware
 	WriteTimeout      time.Duration // Timeout for writing to a client before eviction
+	ClientQueueSize   int           // Per-client queue size for the broadcaster
 
 	// Information about ongoing streams
 	streams    map[AceID]*ongoingStream
@@ -171,24 +170,24 @@ func (a *Acexy) FetchStream(aceId AceID, extraParams url.Values) (*AceStream, er
 		ID:          aceId,
 	}
 
-	writeTimeout := a.WriteTimeout
-	if writeTimeout <= 0 {
-		writeTimeout = 5 * time.Second
+	queueSize := a.ClientQueueSize
+	if queueSize <= 0 {
+		queueSize = 64
 	}
-	writers := pmw.New(context.Background(), writeTimeout)
+	broadcaster := NewBroadcaster(queueSize)
 	os := &ongoingStream{
-		clients: 0,
-		done:    make(chan struct{}),
-		player:  nil,
-		stream:  stream,
-		writers: writers,
-		evicted: make(map[io.Writer]struct{}),
+		clients:     0,
+		done:        make(chan struct{}),
+		player:      nil,
+		stream:      stream,
+		broadcaster: broadcaster,
+		evicted:     make(map[io.Writer]struct{}),
 	}
 	a.streams[aceId] = os
 
-	// When PMultiWriter evicts a slow consumer, record it and decrement the
+	// When the broadcaster evicts a slow consumer, record it and decrement the
 	// client count. StopStream checks this set to avoid double-decrementing.
-	writers.SetOnEvict(func(w io.Writer) {
+	broadcaster.SetOnEvict(func(w io.Writer) {
 		a.mutex.Lock()
 		os.evicted[w] = struct{}{}
 		if os.clients > 0 {
@@ -220,8 +219,8 @@ func (a *Acexy) StartStream(stream *AceStream, out io.Writer) error {
 		return fmt.Errorf(`stream "%s" not found`, stream.ID)
 	}
 
-	// Add the writer to the list of writers
-	ongoingStream.writers.Add(out)
+	// Add the writer to the broadcaster
+	ongoingStream.broadcaster.Add(out)
 
 	// Register the new client
 	ongoingStream.clients++
@@ -263,7 +262,7 @@ func (a *Acexy) StartStream(stream *AceStream, out io.Writer) error {
 		// the copier (started by another client) will try to write to
 		// this client's now-invalid ResponseWriter, causing a nil pointer
 		// dereference panic.
-		ongoingStream.writers.Remove(out)
+		ongoingStream.broadcaster.Remove(out)
 		ongoingStream.clients--
 		shouldRelease := ongoingStream.clients == 0
 		a.mutex.Unlock()
@@ -282,9 +281,9 @@ func (a *Acexy) StartStream(stream *AceStream, out io.Writer) error {
 		return nil
 	}
 
-	// Forward the response to the writers
+	// Forward the response to the broadcaster
 	ongoingStream.copier = &Copier{
-		Destination:  ongoingStream.writers,
+		Destination:  ongoingStream.broadcaster,
 		Source:       resp.Body,
 		EmptyTimeout: a.EmptyTimeout,
 		BufferSize:   a.BufferSize,
@@ -334,8 +333,8 @@ func (a *Acexy) releaseStream(stream *AceStream) error {
 
 	slog.Debug("Stopping stream", "stream", stream.ID)
 
-	// Close writers and player synchronously so the copier exits immediately
-	ongoingStream.writers.Close()
+	// Close broadcaster and player synchronously so the copier exits immediately
+	ongoingStream.broadcaster.Close()
 	if ongoingStream.player != nil {
 		slog.Debug("Closing player", "stream", stream.ID)
 		ongoingStream.player.Body.Close()
@@ -368,10 +367,10 @@ func (a *Acexy) StopStream(stream *AceStream, out io.Writer) error {
 		return fmt.Errorf(`stream "%s" not found`, stream.ID)
 	}
 
-	// Remove the writer from the list of writers
-	ongoingStream.writers.Remove(out)
+	// Remove the writer from the broadcaster
+	ongoingStream.broadcaster.Remove(out)
 
-	// If this writer was already evicted by PMultiWriter timeout, the client
+	// If this writer was already evicted by the broadcaster, the client
 	// count was already decremented in the OnEvict callback. Skip the
 	// decrement to avoid double-counting.
 	if _, wasEvicted := ongoingStream.evicted[out]; wasEvicted {
