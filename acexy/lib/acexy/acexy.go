@@ -46,13 +46,20 @@ type AceStreamCommand struct {
 }
 
 type AcexyStatus struct {
-	Clients               *uint  `json:"clients,omitempty"`
-	Streams               *uint  `json:"streams,omitempty"`
-	ID                    *AceID `json:"stream_id,omitempty"`
-	StatURL               string `json:"stat_url,omitempty"`
-	MaxConnections        int    `json:"max_connections,omitempty"`
-	MaxConcurrentChannels int    `json:"max_concurrent_channels,omitempty"`
-	TotalClients          *uint  `json:"total_clients,omitempty"`
+	Clients               *uint              `json:"clients,omitempty"`
+	Streams               *uint              `json:"streams,omitempty"`
+	ID                    *AceID             `json:"stream_id,omitempty"`
+	StatURL               string             `json:"stat_url,omitempty"`
+	MaxConnections        int                `json:"max_connections,omitempty"`
+	MaxConcurrentChannels int                `json:"max_concurrent_channels,omitempty"`
+	TotalClients          *uint              `json:"total_clients,omitempty"`
+	ActiveStreams         []ActiveStreamInfo `json:"active_streams,omitempty"`
+}
+
+type ActiveStreamInfo struct {
+	ID       string `json:"id"`
+	Infohash string `json:"infohash,omitempty"`
+	Clients  uint   `json:"clients"`
 }
 
 // ErrLimitReached indicates a connection or channel limit has been reached.
@@ -555,8 +562,17 @@ func (a *Acexy) GetStatus(id *AceID) (AcexyStatus, error) {
 	// Return the global status if no ID is given
 	if id == nil {
 		totalClients := uint(0)
-		for _, s := range a.streams {
+		activeStreams := make([]ActiveStreamInfo, 0, len(a.streams))
+		for aid, s := range a.streams {
 			totalClients += s.clients
+			info := ActiveStreamInfo{Clients: s.clients}
+			idType, value := aid.ID()
+			if idType == "id" {
+				info.ID = value
+			} else {
+				info.Infohash = value
+			}
+			activeStreams = append(activeStreams, info)
 		}
 		streams := uint(len(a.streams))
 		return AcexyStatus{
@@ -564,6 +580,7 @@ func (a *Acexy) GetStatus(id *AceID) (AcexyStatus, error) {
 			TotalClients:          &totalClients,
 			MaxConnections:        a.MaxConnections,
 			MaxConcurrentChannels: a.MaxConcurrentChannels,
+			ActiveStreams:         activeStreams,
 		}, nil
 	}
 
