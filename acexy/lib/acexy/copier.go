@@ -69,7 +69,8 @@ func (c *Copier) Copy() error {
 		}
 	}()
 
-	_, err := io.Copy(c, c.Source)
+	defer c.timer.Stop()
+	_, err := io.CopyBuffer(c, struct{ io.Reader }{c.Source}, make([]byte, DEFAULT_COPY_BUFFER_SIZE))
 
 	return err
 }
@@ -96,10 +97,7 @@ func (c *Copier) Write(p []byte) (n int, err error) {
 	dst := c.Destination
 	c.mu.Unlock()
 
-	// Copy the data before passing it to the destination. Some destinations
-	// (e.g. io.Pipe) may hold a reference to the slice after Write returns,
-	// which would race with io.Copy reusing its buffer.
-	p2 := make([]byte, len(p))
-	copy(p2, p)
-	return dst.Write(p2)
+	// Writers consume p before returning; the broadcaster makes the single
+	// immutable copy needed by its asynchronous queues.
+	return dst.Write(p)
 }

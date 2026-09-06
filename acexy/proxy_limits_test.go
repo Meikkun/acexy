@@ -13,23 +13,20 @@ import (
 	"javinator9889/acexy/lib/acexy"
 )
 
-type dummyWriter struct{}
+type dummyWriter struct{ identity byte }
 
 func (d *dummyWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
 func TestHandleStream_RejectsWhenConnectionLimitReached(t *testing.T) {
-	oldMax := maxConnections
-	maxConnections = 1
-	defer func() { maxConnections = oldMax }()
-
 	backend := startMockBackend()
 	defer backend.Close()
 
 	backendURL, _ := url.Parse(backend.URL)
 
 	a := &acexy.Acexy{
+		MaxConnections:    1,
 		Scheme:            "http",
 		Host:              backendURL.Hostname(),
 		Port:              mustParseInt(backendURL.Port()),
@@ -66,16 +63,13 @@ func TestHandleStream_RejectsWhenConnectionLimitReached(t *testing.T) {
 }
 
 func TestHandleStream_AllowsWhenUnderLimit(t *testing.T) {
-	oldMax := maxConnections
-	maxConnections = 10
-	defer func() { maxConnections = oldMax }()
-
 	backend := startMockBackend()
 	defer backend.Close()
 
 	backendURL, _ := url.Parse(backend.URL)
 
 	a := &acexy.Acexy{
+		MaxConnections:    10,
 		Scheme:            "http",
 		Host:              backendURL.Hostname(),
 		Port:              mustParseInt(backendURL.Port()),

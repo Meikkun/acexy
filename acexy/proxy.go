@@ -14,11 +14,11 @@ import (
 	"io"
 	"javinator9889/acexy/lib/acexy"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
-	"sync"
 	"syscall"
 	"time"
 
@@ -40,6 +40,7 @@ var (
 	maxConnections        int
 	maxConcurrentChannels int
 	shutdownTimeout       time.Duration
+	controlSocket         string
 )
 
 //go:embed LICENSE.short
@@ -94,113 +95,78 @@ func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check connection limit before any backend work
-	if maxConnections > 0 {
-		current := p.Acexy.ClientCount()
-		if current >= uint(maxConnections) {
-			slog.Warn("Connection limit reached",
-				"current", current,
-				"max", maxConnections,
-				"client", r.RemoteAddr,
-			)
-			http.Error(w, "Maximum connections reached, try again later", http.StatusServiceUnavailable)
-			return
-		}
-	}
-
-	// Gather the stream information
-	stream, err := p.Acexy.FetchStream(aceId, q)
+	reservation, err := p.Acexy.ReserveAdmission(aceId, q)
 	if err != nil {
-		var limitErr *acexy.ErrLimitReached
-		if errors.As(err, &limitErr) {
-			slog.Warn("Channel limit reached", "stream", aceId, "error", err)
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		} else {
-			slog.Error("Failed to start stream", "stream", aceId, "error", err)
-			http.Error(w, "Failed to start stream: "+err.Error(), http.StatusInternalServerError)
-		}
+		streamError(w, err)
 		return
 	}
+	defer reservation.Release()
 
-	// Set response headers BEFORE starting the stream. Header map writes are safe
-	// before the first Write/WriteHeader call. We intentionally do NOT call
-	// WriteHeader here — Go's HTTP server calls it implicitly on the first Write.
+	downstream, err := newClientWriter(w, p.Acexy.WriteTimeout)
+	if err != nil {
+		http.Error(w, "Streaming requires socket write deadlines", http.StatusInternalServerError)
+		return
+	}
+	stream, err := p.Acexy.FetchReservedStream(r.Context(), reservation)
+	if err != nil {
+		streamError(w, err)
+		return
+	}
+	pr, pw := io.Pipe()
+	client := &clientPipe{PipeWriter: pw, done: make(chan struct{})}
+	defer pr.Close()
+	defer client.Close()
+	if err := p.Acexy.StartReservedStream(r.Context(), reservation, stream, client); err != nil {
+		streamError(w, err)
+		return
+	}
+	defer p.Acexy.StopStream(stream, client)
 	switch p.Acexy.Endpoint {
 	case acexy.M3U8_ENDPOINT:
 		w.Header().Set("Content-Type", "application/x-mpegURL")
 	case acexy.MPEG_TS_ENDPOINT:
 		w.Header().Set("Content-Type", "video/MP2T")
 	}
-
-	// Create a pipe so that PMultiWriter writes to the pipe writer (safe cross-goroutine)
-	// and the HTTP handler goroutine copies from the pipe reader to ResponseWriter.
-	pr, pw := io.Pipe()
-
-	slog.Debug("Starting stream", "path", r.URL.Path, "id", aceId)
-	streamStarted := false
-	if err := p.Acexy.StartStream(stream, pw); err != nil {
-		pw.Close()
-		slog.Error("Failed to start stream", "stream", aceId, "error", err)
-		http.Error(w, "Failed to start stream: "+err.Error(), http.StatusInternalServerError)
-		return
+	w.Header().Set("X-Accel-Buffering", "no")
+	var expiry <-chan time.Time
+	if p.Acexy.Endpoint == acexy.M3U8_ENDPOINT {
+		timer := time.NewTimer(streamTimeout)
+		defer timer.Stop()
+		expiry = timer.C
 	}
-	streamStarted = true
-
-	// Goroutine: copy pipe reader -> ResponseWriter (only this goroutine touches w)
-	doneCopy := make(chan struct{})
+	copyDone, watcherDone := make(chan struct{}), make(chan struct{})
 	go func() {
-		defer close(doneCopy)
-		_, err := io.Copy(w, pr)
-		if err != nil {
-			slog.Debug("Client copy error", "stream", aceId, "error", err)
+		defer close(watcherDone)
+		select {
+		case <-r.Context().Done():
+		case <-client.done:
+		case <-expiry:
+		case <-copyDone:
+			return
 		}
-		pr.Close() // ensure cleanup
+		downstream.Abort()
+		pr.Close()
+		client.Close()
 	}()
-
-	// Defer cleanup: stop stream, close pipe writer, and wait for copy goroutine to finish
-	// before returning. This prevents races between net/http request teardown and our background writes to ResponseWriter.
-	switch p.Acexy.Endpoint {
-	case acexy.M3U8_ENDPOINT:
-		var cleanupOnce sync.Once
-		cleanup := func() {
-			cleanupOnce.Do(func() {
-				p.Acexy.StopStream(stream, pw)
-				pw.Close()
-			})
-		}
-		timer := time.AfterFunc(streamTimeout, cleanup)
-		defer func() {
-			if !timer.Stop() {
-				// Timer already fired; wait for copy goroutine to finish.
-				if streamStarted {
-					<-doneCopy
-				}
-				return
-			}
-			// Timer stopped before firing; run cleanup now.
-			cleanup()
-			if streamStarted {
-				<-doneCopy
-			}
-		}()
-	case acexy.MPEG_TS_ENDPOINT:
-		defer func() {
-			p.Acexy.StopStream(stream, pw)
-			pw.Close()
-			if streamStarted {
-				<-doneCopy
-			}
-		}()
+	// The handler is the sole response writer, including errors and flushing.
+	_, copyErr := io.Copy(downstream, pr)
+	close(copyDone)
+	<-watcherDone
+	if copyErr == nil {
+		_ = downstream.Finish()
 	}
+}
 
-	// Wait for client disconnect, stream finish, or copy goroutine done
-	select {
-	case <-r.Context().Done():
-		slog.Debug("Client disconnected", "path", r.URL.Path)
-	case <-p.Acexy.WaitStream(stream):
-		slog.Debug("Stream finished", "path", r.URL.Path)
-	case <-doneCopy:
-		slog.Debug("Client copy done", "path", r.URL.Path)
+func streamError(w http.ResponseWriter, err error) {
+	var limit *acexy.ErrLimitReached
+	var timeout net.Error
+	switch {
+	case errors.As(err, &limit):
+		http.Error(w, "Maximum connections reached or admission paused, try again later", http.StatusServiceUnavailable)
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &timeout) && timeout.Timeout():
+		http.Error(w, "Upstream startup timed out", http.StatusGatewayTimeout)
+	default:
+		http.Error(w, "Upstream startup failed", http.StatusBadGateway)
 	}
 }
 
@@ -262,7 +228,6 @@ func writeStatusJSON(w http.ResponseWriter, status acexy.AcexyStatus) {
 
 	if err := json.NewEncoder(w).Encode(status); err != nil {
 		slog.Error("Failed to write status", "error", err)
-		http.Error(w, "Failed to write status", http.StatusInternalServerError)
 	}
 }
 
@@ -347,6 +312,8 @@ func (s *Size) String() string { return humanize.Bytes(s.Bytes) }
 func (s *Size) Get() any { return s.Bytes }
 
 func parseArgs() {
+	flag.StringVar(&controlSocket, "control-socket", LookupEnvOrString("ACEXY_CONTROL_SOCKET", ""),
+		"private maintenance Unix socket (disabled when empty); ACEXY_CONTROL_SOCKET")
 	// Parse the command-line arguments
 	flag.BoolFunc("license", "print the license and exit", func(_ string) error {
 		fmt.Println(LICENSE)
@@ -481,6 +448,14 @@ func main() {
 		MaxConcurrentChannels: maxConcurrentChannels,
 	}
 	acexyInstance.Init()
+	control, err := startControl(acexyInstance, controlSocket)
+	if err != nil {
+		slog.Error("Private control startup failed", "error", err)
+		os.Exit(1)
+	}
+	if control != nil {
+		defer control.Close()
+	}
 	slog.Debug("Acexy", "acexy", acexyInstance)
 
 	// Create a new HTTP server
@@ -513,13 +488,23 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	// Step 1: Stop accepting new connections and wait for active HTTP handlers to return.
+	shutdownProxy(ctx, server, acexyInstance)
+
+	slog.Info("Shutdown complete")
+}
+
+func shutdownProxy(ctx context.Context, server *http.Server, a *acexy.Acexy) {
+	// Cancel playback first; HTTP Shutdown alone waits on live handlers forever.
+	done := make(chan struct{})
+	go func() {
+		if err := a.ShutdownContext(ctx); err != nil {
+			slog.Error("Backend shutdown incomplete", "error", err)
+		}
+		close(done)
+	}()
 	if err := server.Shutdown(ctx); err != nil {
 		slog.Error("Server shutdown error", "error", err)
 	}
-
-	// Step 2: Release all AceStream backend sessions.
-	acexyInstance.Shutdown()
-
-	slog.Info("Shutdown complete")
+	<-done
+	_ = server.Close()
 }

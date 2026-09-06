@@ -127,12 +127,95 @@ setting), the proxy will **fall back to the default value** instead of crashing.
 Acexy handles `SIGTERM` and `SIGINT` for graceful shutdown. When a shutdown
 signal is received:
 
-1. The HTTP listener is closed — no new connections are accepted.
-2. Active streaming handlers are allowed to finish within the shutdown timeout.
-3. All AceStream backend sessions are properly released (`method=stop`).
+1. Admission closes and active sessions are cancelled.
+2. Playback bodies and client pipes close; backend stops run concurrently.
+3. HTTP handlers and cleanup share **one** `ACEXY_SHUTDOWN_TIMEOUT` budget.
+   Remaining HTTP connections and cleanup requests are cancelled at its deadline.
+
+Engine-stop failures are not active viewers: `pending_cleanup` reports unresolved
+cleanup separately. Stops have at most two three-second attempts, bounded further
+by shutdown. A failed stop never restarts the engine or another healthy session.
+If metadata acquisition might have reached the engine but no valid command URL
+was recovered, cleanup remains unresolved and idle maintenance is refused.
+Viewer cancellation allows an already-dispatched metadata request to finish
+within its startup deadline so a late command URL can still be stopped.
+Definite pre-dispatch failures (such as a failed connection) do not invent
+backend ownership. Unrecoverable identity requires operator reconciliation;
+Acexy does not guess a stop URL or declare the engine idle.
 
 In Docker Compose, running `docker compose down` sends `SIGTERM` to the
 container, triggering this graceful shutdown automatically.
+
+### Admission and live writes
+
+`ACEXY_MAX_CONNECTIONS` includes both registered clients and pending admissions.
+`ACEXY_MAX_CONCURRENT_CHANNELS` includes metadata requests in flight. Zero still
+means unlimited. Concurrent requests for the same ID share one metadata request
+and one playback request; cancelling one waiter does not cancel other viewers.
+
+`ACEXY_WRITE_TIMEOUT` is renewed before each downstream write, not a maximum
+stream duration. A stalled write, cancellation or queue eviction closes only
+that viewer. Live responses flush chunks and set `X-Accel-Buffering: no`.
+Response-writer wrappers must support `http.ResponseController` deadlines (or
+provide `Unwrap`); unsupported writers fail explicitly rather than disabling
+deadlines. Queue capacity remains 64 chunks by default; chunk sizes vary with
+upstream reads, with a 48,128-byte copy-buffer ceiling.
+Normal upstream EOF drains queued payloads before closing client pipes and
+finishes HTTP framing normally. EOF draining is bounded by the write timeout;
+request cancellation, eviction and shutdown retain the immediate abort path.
+
+Upstream malformed responses and unsuccessful playback status codes return 502;
+startup timeouts return 504, before video headers are committed. Invalid client
+requests retain 400/405 responses and admission limits return 503.
+
+Library callers may keep using `FetchStream`, `StartStream`, `StopStream` and
+`WaitStream`. `StartStream` now enforces `Acexy.MaxConnections`. For cancellable
+startup, call `ReserveAdmission(id, params)`, defer its `Release`, then use
+`FetchReservedStream(ctx, reservation)` and
+`StartReservedStream(ctx, reservation, stream, writer)`. Stop the registered
+writer when finished. All APIs use the same session registry. A legacy
+metadata-only `FetchStream` remains pending until started or shutdown and
+therefore prevents idle maintenance.
+
+### Private maintenance control
+
+Disabled by default. Set `ACEXY_CONTROL_SOCKET` (or `-control-socket`) to a private
+Unix socket path, for example `/run/acexy-control.sock`. The socket and its
+`<socket>.state` file are mode `0600`; the parent directory must be trusted.
+Maintenance transitions are atomically persisted and synced before success is
+returned. Invalid state fails startup; persisted state is restored before public
+HTTP admission opens. Keep the state file when restarting Acexy.
+
+The following HTTP routes exist **only on the Unix socket**, never on public TCP:
+
+| Method / route | Effect |
+|---|---|
+| `GET /status` | Current status; does not change the gate |
+| `POST /quiesce` | Block new distinct channels; allow existing-channel joins |
+| `POST /enter` | Close all admission only when clients, reservations, pending starts and cleanup are zero |
+| `POST /exit` | Explicitly reopen admission; the caller must first verify engine readiness |
+
+Successful calls return 200 with the normal global status JSON. Busy `enter`, or
+attempting to downgrade maintenance through `quiesce`, returns 409. Persistence
+failure returns 500 and fails admission closed. Transition errors include current
+status plus `error: "maintenance_transition_failed"`. Wrong methods return 405.
+Only explicit `exit` reopens a maintenance gate; process restart does not.
+
+Additive global and per-stream status fields are always present:
+
+* `pending_admissions`, `pending_starts`, `pending_cleanup`: numeric counts.
+* `maintenance`: `open`, `quiescing`, or `maintenance`; `maintenance_phase`
+  remains an identical compatibility alias. The state file uses `maintenance_phase`.
+* `admission_paused`: boolean; true also during shutdown. In quiescing mode,
+  existing-channel joins are still permitted.
+
+Global status retains `streams`, `total_clients`, and existing stream information.
+Counts are snapshots, not live pointers. Unknown or unresolved cleanup is not
+permission to stop an engine. This interface does not stop processes or delete
+files: an external maintenance owner must confirm the engine process group is
+gone before deletion, then restart it and check readiness before `exit`.
+Automatic maintenance is safe only if all engine playback passes through Acexy.
+Idle-aware storage cleanup is not a filesystem hard quota.
 
 ## Optimizing 🚀
 
@@ -306,8 +389,9 @@ adjustable by using environment variables.
       <th>
         Per-client queue size for the stream broadcaster.
         Larger values tolerate slower clients but use more memory.
-        Each queue entry holds one TS-aligned chunk (~48KB).
-        A queue size of 64 uses approximately 3MB per client.
+        Entries hold variable-sized chunks up to 48,128 bytes.
+        A full 64-entry queue can retain about 3MB of payload; immutable chunks
+        shared by multiple queues are not copied per client.
       </th>
       <th><code>64</code></th>
     <tr>
@@ -315,7 +399,7 @@ adjustable by using environment variables.
       <th><code>-max-connections</code></th>
       <th><code>ACEXY_MAX_CONNECTIONS</code></th>
       <th>
-        Maximum number of concurrent streaming clients. 0 means unlimited.
+        Maximum registered clients plus pending admissions. 0 means unlimited.
       </th>
       <th><code>0</code> (unlimited)</th>
     <tr>
@@ -323,7 +407,7 @@ adjustable by using environment variables.
       <th><code>-max-concurrent-channels</code></th>
       <th><code>ACEXY_MAX_CONCURRENT_CHANNELS</code></th>
       <th>
-        Maximum number of distinct AceStream broadcasts. 0 means unlimited.
+        Maximum distinct sessions, including metadata starts in flight. 0 means unlimited.
       </th>
       <th><code>0</code> (unlimited)</th>
     <tr>
@@ -332,16 +416,22 @@ adjustable by using environment variables.
       <th><code>ACEXY_SHUTDOWN_TIMEOUT</code></th>
       <th>
         Time to wait for graceful shutdown after receiving SIGTERM or SIGINT.
-        Active streams are drained and backend sessions are released within this timeout.
+        Sessions are cancelled and backend cleanup shares this one timeout.
       </th>
       <th><code>10s</code></th>
+    <tr>
+    <tr>
+      <th><code>-control-socket</code></th>
+      <th><code>ACEXY_CONTROL_SOCKET</code></th>
+      <th>Private Unix maintenance socket. Its durable gate state is kept in the adjacent .state file.</th>
+      <th>Empty (disabled)</th>
     <tr>
   </tbody>
 </table>
 
 > **Streaming Behavior**: Acexy does not use a large server-side playback buffer.
 > Large output buffers caused burst writes and could destabilize live MPEG-TS playback.
-> Acexy forwards stream data in small TS-aligned chunks (~48KB) and isolates slow clients
+> Acexy forwards variable-sized chunks using a TS-aligned 48,128-byte copy buffer and isolates slow clients
 > using per-client bounded queues. Player buffering should be configured in the player,
 > not in Acexy.
 >

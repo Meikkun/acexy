@@ -2,6 +2,7 @@ package acexy
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"sync"
 	"testing"
@@ -197,4 +198,74 @@ func TestBroadcaster_Race(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+type payloadBarrier struct {
+	started chan struct{}
+	release chan struct{}
+	payload chan []byte
+}
+
+func (w *payloadBarrier) Write(p []byte) (int, error) {
+	close(w.started)
+	<-w.release
+	w.payload <- append([]byte(nil), p...)
+	return len(p), nil
+}
+
+func TestBroadcasterOwnsPayload(t *testing.T) {
+	b := NewBroadcaster(64)
+	defer b.Close()
+	writer := &payloadBarrier{started: make(chan struct{}), release: make(chan struct{}), payload: make(chan []byte, 1)}
+	b.Add(writer)
+	input := []byte("immutable")
+	if _, err := b.Write(input); err != nil {
+		t.Fatal(err)
+	}
+	<-writer.started
+	for i := range input {
+		input[i] = 'x'
+	}
+	close(writer.release)
+	if got := string(<-writer.payload); got != "immutable" {
+		t.Fatalf("queued payload aliases reused copier buffer: %q", got)
+	}
+}
+
+func TestBroadcasterDrainPreservesQueuedPayload(t *testing.T) {
+	b := NewBroadcaster(64)
+	defer b.Close()
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	b.Add(writer)
+	for _, chunk := range []string{"first", "second", "third"} {
+		if _, err := b.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- b.Drain(ctx) }()
+	payload, err := io.ReadAll(reader)
+	if err != nil || string(payload) != "firstsecondthird" {
+		t.Fatalf("EOF discarded queued payload: %q %v", payload, err)
+	}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBroadcasterDrainCancellationUnblocksWriter(t *testing.T) {
+	b := NewBroadcaster(64)
+	defer b.Close()
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	b.Add(writer)
+	b.Write([]byte("blocked"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := b.Drain(ctx); err != context.Canceled {
+		t.Fatalf("cancelled drain returned %v", err)
+	}
 }
