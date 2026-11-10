@@ -185,8 +185,8 @@ func (a *Acexy) Init() {
 	a.phase = "open"
 	a.cleanupCtx, a.cleanupCancel = context.WithCancel(context.Background())
 	a.middleware = &http.Client{Transport: &http.Transport{
-		DisableCompression: true, MaxIdleConns: 10, MaxConnsPerHost: 10,
-		IdleConnTimeout:       30 * time.Second,
+		// The engine can stall playback redirects on reused HTTP connections.
+		DisableKeepAlives: true, DisableCompression: true, MaxConnsPerHost: 10,
 		ResponseHeaderTimeout: a.startupTimeout(), ExpectContinueTimeout: time.Second,
 	}}
 }

@@ -8,10 +8,72 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestRedirectedPlaybackUsesFreshBackendConnections(t *testing.T) {
+	var mu sync.Mutex
+	used := make(map[string]bool)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		reused := used[r.RemoteAddr]
+		used[r.RemoteAddr] = true
+		mu.Unlock()
+		if reused {
+			<-r.Context().Done()
+			return
+		}
+		switch r.URL.Path {
+		case "/ace/getstream":
+			fmt.Fprintf(w, `{"response":{"playback_url":"http://%s/play","command_url":"http://%s/stop"}}`, r.Host, r.Host)
+		case "/play":
+			http.Redirect(w, r, "/content", http.StatusFound)
+		case "/content":
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			ticker := time.NewTicker(5 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-ticker.C:
+					if _, err := w.Write([]byte("live bytes")); err != nil {
+						return
+					}
+					w.(http.Flusher).Flush()
+				}
+			}
+		case "/stop":
+			fmt.Fprint(w, `{"response":"ok"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	u, _ := url.Parse(backend.URL)
+	a := &Acexy{Scheme: "http", Host: u.Hostname(), Port: mustParseInt(u.Port()),
+		Endpoint: MPEG_TS_ENDPOINT, NoResponseTimeout: 300 * time.Millisecond, EmptyTimeout: time.Second}
+	a.Init()
+	t.Cleanup(func() { a.Shutdown(); backend.Close() })
+	stream, err := a.FetchStream(AceID{id: "redirected-live"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := &discardClient{}
+	if err := a.StartStream(stream, writer); err != nil {
+		t.Fatal("redirected playback did not start:", err)
+	}
+	eventually(t, func() bool { return writer.bytes.Load() > 0 })
+	a.StopStream(stream, writer)
+	a.workers.Wait()
+	status, _ := a.GetStatus(nil)
+	if status.PendingCleanup != 0 {
+		t.Fatal("redirected playback left unresolved cleanup")
+	}
+}
 
 func TestMetadataTimeoutPreservesUncertainBackendOwnership(t *testing.T) {
 	t.Run("timeout", func(t *testing.T) { testUncertainMetadataOwnership(t, false) })
